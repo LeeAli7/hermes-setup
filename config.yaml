@@ -1,0 +1,23 @@
+model:
+  default: deepseek-v4-flash-free
+  provider: opencode-zen
+  base_url: http://127.0.0.1:9000/zen/v1
+provider: opencode-zen
+toolsets:
+- hermes-cli
+platform_toolsets:
+  telegram:
+  - hermes-telegram
+terminal:
+  backend: local
+  timeout: 180
+telegram:
+  reactions: false
+display:
+  streaming: true
+  language: ru
+  interface: cli
+logging:
+  level: INFO
+  max_size_mb: 5
+  backup_count: 3

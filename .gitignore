@@ -1,0 +1,7 @@
+.env
+proxy_state.json
+gateway_state.json
+*.pid
+logs/
+tor/Data/
+tor/tor.log

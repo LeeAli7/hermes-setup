@@ -1,0 +1,10 @@
+SocksPort 127.0.0.1:9050
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
+DataDirectory /home/ali/hermes/tor/Data
+GeoIPFile /usr/share/tor/geoip
+GeoIPv6File /usr/share/tor/geoip6
+SafeLogging 1
+Log notice file /home/ali/hermes/tor/tor.log
+ExitNodes {de},{fr},{us},{nl},{gb}
+StrictNodes 1
