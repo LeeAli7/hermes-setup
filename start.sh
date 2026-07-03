@@ -14,6 +14,10 @@ mkdir -p "$HERMES_DIR/logs"
 
 case "${1:-start}" in
     start)
+        echo "Starting Tailscale Serve..."
+        tailscale serve --bg --http=9000 http://127.0.0.1:9000 > /dev/null 2>&1
+        tailscale serve --bg --http=9001 http://127.0.0.1:9001 > /dev/null 2>&1
+
         echo "Starting Hermes Proxy Manager..."
         if [ -f "$PIDFILE" ]; then
             pid=$(cat "$PIDFILE")
