@@ -187,14 +187,14 @@ def renew_tor_ip():
 
 def kill_forwarder():
     try:
-        subprocess.run(["pkill", "-f", "forwarder.py"], capture_output=True, timeout=5)
+        subprocess.run(["pkill", "-f", r"forwarder\.py 9000"], capture_output=True, timeout=5)
     except:
         pass
 
 
 def is_forwarder_alive():
     try:
-        r = subprocess.run(["pgrep", "-f", "forwarder.py"], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(["pgrep", "-f", r"forwarder\.py 9000"], capture_output=True, text=True, timeout=5)
         return len(r.stdout.strip()) > 0
     except:
         return False
@@ -265,25 +265,36 @@ RATE_LIMIT_PATTERNS = [
 
 def scan_for_429(state):
     try:
-        pos = state.get("log_position", 0)
-        if not HERMES_LOG.exists():
-            return []
-        size = HERMES_LOG.stat().st_size
-        if pos > size:
-            pos = 0
-        if pos == size:
-            return []
-        with open(HERMES_LOG, "r", encoding="utf-8", errors="replace") as f:
-            f.seek(pos)
-            lines = f.readlines()
-            state["log_position"] = f.tell()
-        save_state(state)
         hits = []
-        for line in lines:
-            for pat in RATE_LIMIT_PATTERNS:
-                if re.search(pat, line, re.IGNORECASE):
-                    hits.append(line.strip()[:120])
-                    break
+        pos = state.get("log_position", 0)
+        if HERMES_LOG.exists():
+            size = HERMES_LOG.stat().st_size
+            if pos <= size:
+                if pos < size:
+                    with open(HERMES_LOG, "r", encoding="utf-8", errors="replace") as f:
+                        f.seek(pos)
+                        lines = f.readlines()
+                        state["log_position"] = f.tell()
+                    save_state(state)
+                    for line in lines:
+                        for pat in RATE_LIMIT_PATTERNS:
+                            if re.search(pat, line, re.IGNORECASE):
+                                hits.append("[agent] " + line.strip()[:120])
+                                break
+
+        fwd_pos = state.get("forwarder_log_position", 0)
+        if FORWARDER_LOG.exists():
+            size = FORWARDER_LOG.stat().st_size
+            if fwd_pos <= size:
+                if fwd_pos < size:
+                    with open(FORWARDER_LOG, "r", encoding="utf-8", errors="replace") as f:
+                        f.seek(fwd_pos)
+                        lines = f.readlines()
+                        state["forwarder_log_position"] = f.tell()
+                    save_state(state)
+                    for line in lines:
+                        if re.search(r"429", line, re.IGNORECASE):
+                            hits.append("[forwarder] " + line.strip()[:120])
         return hits
     except Exception as e:
         log(f"scan error: {e}")

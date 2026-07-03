@@ -7,7 +7,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "proxy_state.json")
-LOG_FILE = os.path.join(BASE_DIR, "logs", "forwarder.log")
+LOG_FILE = os.path.join(BASE_DIR, "logs", "kilo_forwarder.log")
 
 os.makedirs(os.path.join(BASE_DIR, "logs"), exist_ok=True)
 
@@ -16,13 +16,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("forwarder")
+log = logging.getLogger("kilo_forwarder")
 
-UPSTREAM_BASE = "https://opencode.ai"
+UPSTREAM_BASE = "https://api.kilo.ai"
 CONTROL_PORT = 9051
 SOCKS_PORT = 9050
-UPSTREAM_READ_TIMEOUT = 300  # upstream response timeout (seconds)
-UPSTREAM_CONNECT_TIMEOUT = 10
 
 FORBIDDEN_HEADERS = {"host", "content-length", "transfer-encoding", "connection", "accept-encoding"}
 
@@ -163,7 +161,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             try:
                 resp = requests.request(
                     method=method, url=url, data=body, headers=headers,
-                    proxies=proxy, timeout=(UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_READ_TIMEOUT), stream=True, verify=False,
+                    proxies=proxy, timeout=(10, 60), stream=True, verify=False,
                 )
                 log.info(f"Response: {resp.status_code} for {self.path} attempt={attempt+1}")
 
@@ -209,26 +207,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             except requests.exceptions.Timeout:
                 log.error(f"Timeout for {method} {self.path}")
-                self.send_error(502, "Forwarder Error: Upstream timeout")
+                self.send_error(502, "Kilo Forwarder Error: Upstream timeout")
                 return
             except requests.exceptions.ProxyError as e:
                 log.error(f"ProxyError for {method} {self.path}: {e}")
-                self.send_error(502, "Forwarder Error: Proxy failed")
+                self.send_error(502, "Kilo Forwarder Error: Proxy failed")
                 return
             except requests.exceptions.ConnectionError as e:
                 log.error(f"ConnectionError for {method} {self.path}: {e}")
-                self.send_error(502, "Forwarder Error: Connection failed")
+                self.send_error(502, "Kilo Forwarder Error: Connection failed")
                 return
             except Exception as e:
                 log.error(f"Error for {method} {self.path}: {e}", exc_info=True)
-                self.send_error(502, f"Forwarder Error: {e}")
+                self.send_error(502, f"Kilo Forwarder Error: {e}")
                 return
 
 
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9000
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9001
     server = ThreadingHTTPServer(("127.0.0.1", port), ProxyHandler)
-    log.info(f"Forwarder started on port {port}")
+    log.info(f"Kilo forwarder started on port {port}")
     server.serve_forever()
 
 
