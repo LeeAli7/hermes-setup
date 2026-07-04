@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Kiro Gateway — OpenAI-совместимый прокси для Amazon Q Developer API.
-Без лимитов, с авто-логином и авто-обновлением токена.
+Без лимитов, с tool calls, с авто-логином и авто-обновлением токена.
 
 Зависимости: pip install requests boto3
 """
@@ -50,33 +50,22 @@ def save_creds(creds):
     os.chmod(CREDS_FILE, 0o600)
 
 def try_import_kiro_cli():
-    """Пытаемся вытянуть токен из базы kiro-cli, если он установлен."""
     if not os.path.exists(KIRO_DB):
         return None
     try:
         import sqlite3
         conn = sqlite3.connect(KIRO_DB)
-        token_row = conn.execute(
-            "SELECT value FROM auth_kv WHERE key='kirocli:odic:token'"
-        ).fetchone()
-        reg_row = conn.execute(
-            "SELECT value FROM auth_kv WHERE key='kirocli:odic:device-registration'"
-        ).fetchone()
+        token_row = conn.execute("SELECT value FROM auth_kv WHERE key='kirocli:odic:token'").fetchone()
+        reg_row = conn.execute("SELECT value FROM auth_kv WHERE key='kirocli:odic:device-registration'").fetchone()
         conn.close()
         if not token_row or not reg_row:
             return None
-        tok = json.loads(token_row[0])
-        reg = json.loads(reg_row[0])
+        tok, reg = json.loads(token_row[0]), json.loads(reg_row[0])
         exp_str = tok.get("expires_at", "0").replace("Z", "+00:00")
         exp_dt = datetime.fromisoformat(exp_str)
-        creds = {
-            "client_id": reg["client_id"],
-            "client_secret": reg["client_secret"],
-            "access_token": tok["access_token"],
-            "refresh_token": tok.get("refresh_token", ""),
-            "expires_at": int(exp_dt.timestamp()),
-            "region": REGION,
-        }
+        creds = {"client_id": reg["client_id"], "client_secret": reg["client_secret"],
+                 "access_token": tok["access_token"], "refresh_token": tok.get("refresh_token", ""),
+                 "expires_at": int(exp_dt.timestamp()), "region": REGION}
         save_creds(creds)
         log.info("Imported credentials from kiro-cli")
         return creds
@@ -89,7 +78,7 @@ def bearer_token():
     if not creds:
         creds = try_import_kiro_cli()
     if not creds:
-        raise Exception("Нет токена. Запусти: python3 kiro-gateway.py login")
+        raise Exception("No token. Run: python3 kiro-gateway.py login")
     now = int(time.time())
     expires_at = int(creds.get("expires_at", 0))
     if now >= expires_at - 60:
@@ -99,54 +88,38 @@ def bearer_token():
             log.warning(f"Token refresh failed: {e}, using current token")
     return creds["access_token"]
 
-# --- OIDC login (через boto3) ---
+# --- OIDC login ---
 
 def oidc_client():
     import boto3
     from botocore.config import Config
-    return boto3.client(
-        "sso-oidc", region_name=REGION,
-        aws_access_key_id="AKIA" + "X" * 16,
-        aws_secret_access_key="X" * 40,
-        config=Config(signature_version="unsigned", connect_timeout=10, read_timeout=10)
-    )
+    return boto3.client("sso-oidc", region_name=REGION,
+        aws_access_key_id="AKIA" + "X" * 16, aws_secret_access_key="X" * 40,
+        config=Config(signature_version="unsigned", connect_timeout=10, read_timeout=10))
 
 def cmd_login():
-    print("Авторизация через AWS Builder ID...")
+    print("Authorizing via AWS Builder ID...")
     client = oidc_client()
-    reg = client.register_client(
-        clientName="kiro-gateway", clientType="public", scopes=SCOPES
-    )
+    reg = client.register_client(clientName="kiro-gateway", clientType="public", scopes=SCOPES)
     cid, csecret = reg["clientId"], reg["clientSecret"]
-
-    auth = client.start_device_authorization(
-        clientId=cid, clientSecret=csecret, startUrl="https://view.awsapps.com/start"
-    )
-
-    print(f"\nОткрой в браузере: {auth['verificationUriComplete']}")
-    print(f"Код: {auth['userCode']}")
-    try:
-        webbrowser.open(auth["verificationUriComplete"])
-    except:
-        pass
-
-    print("\nОжидание авторизации...", end="", flush=True)
+    auth = client.start_device_authorization(clientId=cid, clientSecret=csecret, startUrl="https://view.awsapps.com/start")
+    print(f"\nOpen: {auth['verificationUriComplete']}\nCode: {auth['userCode']}")
+    try: webbrowser.open(auth["verificationUriComplete"])
+    except: pass
+    print("\nWaiting...", end="", flush=True)
     expires_at = int(time.time()) + auth["expiresIn"]
     creds = {"client_id": cid, "client_secret": csecret}
     while time.time() < expires_at:
         time.sleep(auth["interval"])
         try:
-            token = client.create_token(
-                clientId=cid, clientSecret=csecret,
-                grantType="urn:ietf:params:oauth:grant-type:device_code",
-                deviceCode=auth["deviceCode"]
-            )
+            token = client.create_token(clientId=cid, clientSecret=csecret,
+                grantType="urn:ietf:params:oauth:grant-type:device_code", deviceCode=auth["deviceCode"])
             creds["access_token"] = token["accessToken"]
             creds["refresh_token"] = token.get("refreshToken", "")
             creds["expires_at"] = int(time.time()) + token.get("expiresIn", 3600)
             creds["region"] = REGION
             save_creds(creds)
-            print("\nУспешно авторизован!")
+            print("\nLogged in!")
             return creds
         except client.exceptions.AuthorizationPendingException:
             print(".", end="", flush=True)
@@ -157,51 +130,71 @@ def cmd_login():
                 print(".", end="", flush=True)
             else:
                 raise
-    raise Exception("Таймаут авторизации")
+    raise Exception("Auth timeout")
 
 def refresh_token(creds):
     import boto3
     from botocore.config import Config
-    client = boto3.client(
-        "sso-oidc", region_name=REGION,
-        aws_access_key_id="AKIA" + "X" * 16,
-        aws_secret_access_key="X" * 40,
-        config=Config(signature_version="unsigned")
-    )
+    client = boto3.client("sso-oidc", region_name=REGION,
+        aws_access_key_id="AKIA" + "X" * 16, aws_secret_access_key="X" * 40,
+        config=Config(signature_version="unsigned"))
     try:
-        token = client.create_token(
-            clientId=creds["client_id"], clientSecret=creds["client_secret"],
-            grantType="refresh_token", refreshToken=creds["refresh_token"]
-        )
+        token = client.create_token(clientId=creds["client_id"], clientSecret=creds["client_secret"],
+            grantType="refresh_token", refreshToken=creds["refresh_token"])
         creds["access_token"] = token["accessToken"]
         creds["expires_at"] = int(time.time()) + token.get("expiresIn", 3600)
         if token.get("refreshToken"):
             creds["refresh_token"] = token["refreshToken"]
         save_creds(creds)
-        log.info("Токен обновлён")
+        log.info("Token refreshed")
         return creds
     except Exception as e:
         log.warning(f"Token refresh failed: {e}, keeping current token")
         return creds
 
-# --- Amazon Q API call ---
+# --- tool converters ---
 
-def call_api(msgs, model=DEFAULT_MODEL):
+def convert_tools(openai_tools):
+    """OpenAI tools format -> Kiro tools format."""
+    if not openai_tools:
+        return None
+    kiro_tools = []
+    for t in openai_tools:
+        fn = t.get("function", t)
+        kiro_tools.append({
+            "toolSpecification": {
+                "name": fn.get("name", "unknown"),
+                "description": fn.get("description", ""),
+                "inputSchema": {
+                    "json": fn.get("parameters", {"type": "object", "properties": {}})
+                }
+            }
+        })
+    return kiro_tools
+
+# --- API call ---
+
+def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
     token = bearer_token()
     cid = str(uuid.uuid4())
     history = []
     pending_system = KIRO_DEFANG + "\n"
 
-    def make_user_msg(content):
+    def make_user_msg(content, ctx=None):
+        if ctx is None:
+            ctx = {"envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}}
         return {
             "userInputMessage": {
                 "content": content,
-                "userInputMessageContext": {
-                    "envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}
-                },
+                "userInputMessageContext": ctx,
                 "origin": "KIRO_CLI", "modelId": model
             }
         }
+
+    base_ctx = {"envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}}
+    kiro_tools = convert_tools(openai_tools)
+    if kiro_tools:
+        base_ctx["tools"] = kiro_tools
 
     for m in msgs[:-1]:
         r = m.get("role", "user")
@@ -213,7 +206,7 @@ def call_api(msgs, model=DEFAULT_MODEL):
             if pending_system:
                 content = pending_system + content
                 pending_system = ""
-            history.append(make_user_msg(content))
+            history.append(make_user_msg(content, base_ctx))
         elif r == "assistant":
             tc = m.get("tool_calls")
             if tc:
@@ -230,7 +223,8 @@ def call_api(msgs, model=DEFAULT_MODEL):
             if pending_system:
                 pending_system = ""
             history.append(make_user_msg(
-                f"[TOOL_RESULT: {m.get('tool_call_id', '?')}]\n{content}"
+                f"[Tool result for {m.get('tool_call_id', '')}]: {content}",
+                base_ctx
             ))
 
     current = msgs[-1] if msgs else {"role": "user", "content": ""}
@@ -240,9 +234,8 @@ def call_api(msgs, model=DEFAULT_MODEL):
 
     payload = {
         "conversationState": {
-            "conversationId": cid,
-            "history": history,
-            "currentMessage": make_user_msg(current_content),
+            "conversationId": cid, "history": history,
+            "currentMessage": make_user_msg(current_content, base_ctx),
             "chatTriggerType": "MANUAL", "agentTaskType": "vibe"
         },
         "profileArn": PROFILE_ARN
@@ -255,10 +248,10 @@ def call_api(msgs, model=DEFAULT_MODEL):
         "Host": f"runtime.{REGION}.kiro.dev",
         "x-amzn-codewhisperer-optout": "false",
     }
-    log.info(f"[>] {model} {len(msgs)}msgs")
+    log.info(f"[>] {model} {len(msgs)}msgs tools={bool(kiro_tools)}")
     return requests.post(RUNTIME, headers=headers, json=payload, stream=True, timeout=120)
 
-# --- AWS EventStream parser ---
+# --- AWS EventStream parser + OpenAI converter ---
 
 def parse_events(raw_iter):
     buf = b""
@@ -288,6 +281,69 @@ def parse_events(raw_iter):
             except json.JSONDecodeError:
                 data = {"_raw": pbytes.decode(errors="replace")}
             yield hdrs.get(":event-type", "unknown"), data
+
+class ToolCallAccumulator:
+    """Accumulates streamed toolUseEvent chunks into complete tool calls."""
+    def __init__(self):
+        self.calls = {}
+        self.order = []
+
+    def feed(self, data):
+        tid = data.get("toolUseId")
+        if not tid:
+            return
+        if tid not in self.calls:
+            self.calls[tid] = {"name": data.get("name", ""), "toolUseId": tid, "input_chunks": []}
+            self.order.append(tid)
+        if "input" in data:
+            self.calls[tid]["input_chunks"].append(data["input"])
+
+    def finalize(self):
+        result = []
+        for idx, tid in enumerate(self.order):
+            c = self.calls[tid]
+            full_input = "".join(c["input_chunks"])
+            result.append({
+                "id": tid,
+                "type": "function",
+                "function": {
+                    "name": c["name"],
+                    "arguments": full_input
+                }
+            })
+        return result
+
+def build_response(events_iter, model):
+    """Process events and produce an OpenAI-format response dict."""
+    content = ""
+    acc = ToolCallAccumulator()
+    stop_reason = "stop"
+
+    for etype, data in events_iter:
+        if etype == "assistantResponseEvent":
+            content += data.get("content", "")
+        elif etype == "toolUseEvent":
+            acc.feed(data)
+        elif etype == "metadataEvent":
+            sr = data.get("stopReason", "")
+            if sr == "TOOL_USE":
+                stop_reason = "tool_calls"
+            elif sr == "END_TURN":
+                stop_reason = "stop"
+
+    tool_calls = acc.finalize()
+    msg = {"role": "assistant"}
+    if content:
+        msg["content"] = content
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+
+    return {
+        "id": f"cmpl-{uuid.uuid4().hex[:12]}", "object": "chat.completion",
+        "created": int(time.time()), "model": model,
+        "choices": [{"index": 0, "message": msg, "finish_reason": stop_reason}],
+        "usage": {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0}
+    }
 
 # --- HTTP server ---
 
@@ -334,32 +390,22 @@ class GatewayHandler(BaseHTTPRequestHandler):
         model = req.get("model", DEFAULT_MODEL)
         msgs = req.get("messages",[])
         stream = req.get("stream", False)
+        tools = req.get("tools", None)
         if not msgs:
             self._json({"error":"no messages"},400); return
         try:
             if stream:
-                self._stream(model,msgs)
+                self._stream(model, msgs, tools)
             else:
-                self._nonstream(model,msgs)
+                resp = call_api(msgs, model, tools)
+                result = build_response(parse_events(resp.iter_content(chunk_size=4096)), model)
+                self._json(result)
         except Exception as e:
             log.error(f"ERR: {e}")
             self._json({"error":str(e)},500)
 
-    def _nonstream(self, model, msgs):
-        resp = call_api(msgs, model)
-        content = ""
-        for etype, data in parse_events(resp.iter_content(chunk_size=4096)):
-            if etype == "assistantResponseEvent":
-                content += data.get("content","")
-        self._json({
-            "id": f"cmpl-{uuid.uuid4().hex[:12]}", "object":"chat.completion",
-            "created": int(time.time()), "model": model,
-            "choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}],
-            "usage":{"total_tokens":0,"prompt_tokens":0,"completion_tokens":0}
-        })
-
-    def _stream(self, model, msgs):
-        resp = call_api(msgs, model)
+    def _stream(self, model, msgs, tools):
+        resp = call_api(msgs, model, tools)
         self.send_response(200)
         self.send_header("Content-Type","text/event-stream")
         self.send_header("Cache-Control","no-cache")
@@ -367,13 +413,50 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         cid = f"cmpl-{uuid.uuid4().hex[:12]}"
         ts = int(time.time())
+
+        sent_role = False
+        finish_reason = "stop"
+        active_tools = {}
+        next_tool_idx = 0
+
+        def emit(choices, fr=None):
+            nonlocal sent_role
+            d = {"id":cid,"object":"chat.completion.chunk","created":ts,"model":model,
+                 "choices":[{"index":0,"delta":choices,"finish_reason":fr}]}
+            self.wfile.write(f"data: {json.dumps(d)}\n\n".encode()); self.wfile.flush()
+            sent_role = True
+
         for etype, data in parse_events(resp.iter_content(chunk_size=4096)):
             if etype == "assistantResponseEvent":
-                text = data.get("content","")
+                text = data.get("content", "")
                 if text:
-                    self.wfile.write(f"data: {json.dumps({'id':cid,'object':'chat.completion.chunk','created':ts,'model':model,'choices':[{'index':0,'delta':{'content':text},'finish_reason':None}]})}\n\n".encode())
-                    self.wfile.flush()
-        self.wfile.write(f"data: {json.dumps({'id':cid,'object':'chat.completion.chunk','created':ts,'model':model,'choices':[{'index':0,'delta':{},'finish_reason':'stop'}]})}\n\n".encode())
+                    if not sent_role:
+                        emit({"role":"assistant","content":""})
+                    emit({"content": text})
+
+            elif etype == "toolUseEvent":
+                tid = data.get("toolUseId")
+                if not tid:
+                    continue
+                if tid not in active_tools:
+                    active_tools[tid] = next_tool_idx
+                    next_tool_idx += 1
+                    if not sent_role:
+                        emit({"role":"assistant","content":None})
+                    emit({"tool_calls":[{"index":active_tools[tid],"id":tid,
+                          "type":"function","function":{"name":data.get("name",""),"arguments":""}}]})
+                inp = data.get("input")
+                if inp is not None:
+                    emit({"tool_calls":[{"index":active_tools[tid],"function":{"arguments":inp}}]})
+
+            elif etype == "metadataEvent":
+                sr = data.get("stopReason", "")
+                if sr == "TOOL_USE":
+                    finish_reason = "tool_calls"
+                elif sr == "END_TURN":
+                    finish_reason = "stop"
+
+        emit({}, fr=finish_reason)
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
@@ -384,48 +467,39 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
 def main():
     if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help"):
-        print("Kiro Gateway — прокси для Amazon Q Developer API")
+        print(f"Kiro Gateway - Amazon Q Developer API proxy with tool calls")
         print()
-        print("  python3 kiro-gateway.py            — запустить прокси на :8080")
-        print("  python3 kiro-gateway.py login      — авторизоваться через AWS Builder ID")
-        print("  python3 kiro-gateway.py status     — проверить статус")
+        print(f"  python3 {sys.argv[0]}            - start proxy on :{PORT}")
+        print(f"  python3 {sys.argv[0]} login      - authorize via AWS Builder ID")
+        print(f"  python3 {sys.argv[0]} status     - check status")
         return
 
     if len(sys.argv) >= 2:
         cmd = sys.argv[1]
         if cmd == "login":
-            cmd_login()
-            return
+            cmd_login(); return
         elif cmd == "status":
             try:
                 creds = load_creds()
-                if not creds:
-                    creds = try_import_kiro_cli()
+                if not creds: creds = try_import_kiro_cli()
                 if creds:
                     exp = datetime.fromtimestamp(creds["expires_at"], tz=timezone.utc)
-                    print(f"Токен действителен до: {exp.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                    print(f"Token expires: {exp.strftime('%Y-%m-%d %H:%M:%S UTC')}")
                 else:
-                    print("Нет токена. Запусти: python3 kiro-gateway.py login")
+                    print("No token. Run: python3 kiro-gateway.py login")
                 r = requests.get(f"http://localhost:{PORT}/health", timeout=2)
-                print("Сервер: ЗАПУЩЕН" if r.status_code == 200 else "Сервер: НЕ ЗАПУЩЕН")
+                print("Server: RUNNING" if r.status_code == 200 else "Server: NOT RUNNING")
             except:
-                print("Сервер: НЕ ЗАПУЩЕН")
+                print("Server: NOT RUNNING")
             return
 
-    # Авто-импорт из kiro-cli при первом запуске
     if not load_creds():
         try_import_kiro_cli()
 
     srv = HTTPServer(("0.0.0.0", PORT), GatewayHandler)
     srv.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    print(f"=== Kiro Gateway на http://localhost:{PORT}/v1/chat/completions ===")
-    creds = load_creds()
-    if creds:
-        exp = datetime.fromtimestamp(creds["expires_at"], tz=timezone.utc)
-        print(f"Токен до: {exp.strftime('%Y-%m-%d %H:%M:%S UTC')} (авто-обновление)")
-    else:
-        print("Нет токена! Запусти: python3 kiro-gateway.py login")
-    print("ЛИМИТОВ НЕТ. НИКОГДА.")
+    print(f"=== Kiro Gateway on http://localhost:{PORT}/v1/chat/completions ===")
+    print("Tool calls: YES | Streaming: YES | NO USAGE LIMITS")
     srv.serve_forever()
 
 if __name__ == "__main__":
