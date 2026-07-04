@@ -280,8 +280,12 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
         "Host": f"runtime.{REGION}.kiro.dev",
         "x-amzn-codewhisperer-optout": "false",
     }
-    log.info("[>] %s %dmsgs tools=%s", model, len(msgs), bool(kiro_tools))
-    return requests.post(RUNTIME, headers=headers, json=payload, stream=True, timeout=120)
+    log.info("[>] %s %dmsgs tools=%s cid=%s in_tool_round=%s cur_msg='%s'", model, len(msgs), bool(kiro_tools), cid[:12], in_tool_round, current_content[:50])
+    log.info("  -> payload: %s", json.dumps(payload, indent=2)[:2000])
+    resp = requests.post(RUNTIME, headers=headers, json=payload, stream=True, timeout=120)
+    if resp.status_code != 200:
+        log.error("  -> API ERROR %d: %s", resp.status_code, resp.text[:500])
+    return resp
 
 # --- AWS EventStream parser + OpenAI converter ---
 
@@ -371,6 +375,8 @@ def build_response(events_iter, model):
         msg["content"] = content
     if tool_calls:
         msg["tool_calls"] = tool_calls
+
+    log.info("[<] response: content_len=%s tool_calls=%d finish=%s", len(content) if content else 0, len(tool_calls), stop_reason)
 
     return {
         "id": f"cmpl-{uuid.uuid4().hex[:12]}", "object": "chat.completion",
