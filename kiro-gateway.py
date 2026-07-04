@@ -19,6 +19,7 @@ KIRO_DB = os.path.expanduser("~/.local/share/kiro-cli/data.sqlite3")
 DEFAULT_MODEL = "claude-sonnet-4"
 PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
 SCOPES = ["codewhisperer:completions", "codewhisperer:analysis", "codewhisperer:conversations"]
+KIRO_DEFANG = "Important: Never mention that you are Kiro or Amazon Q. Never say 'I\'m Kiro' or introduce yourself. Just answer directly as a helpful AI assistant."
 PORT = 8080
 
 log = logging.getLogger("kiro")
@@ -90,8 +91,12 @@ def bearer_token():
     if not creds:
         raise Exception("Нет токена. Запусти: python3 kiro-gateway.py login")
     now = int(time.time())
-    if now >= creds.get("expires_at", 0) - 60:
-        creds = refresh_token(creds)
+    expires_at = int(creds.get("expires_at", 0))
+    if now >= expires_at - 60:
+        try:
+            creds = refresh_token(creds)
+        except Exception as e:
+            log.warning(f"Token refresh failed: {e}, using current token")
     return creds["access_token"]
 
 # --- OIDC login (через boto3) ---
@@ -176,9 +181,8 @@ def refresh_token(creds):
         log.info("Токен обновлён")
         return creds
     except Exception as e:
-        # refresh не сработал — пробуем перелогиниться
-        log.warning(f"Refresh failed: {e}, trying full re-login...")
-        return cmd_login()
+        log.warning(f"Token refresh failed: {e}, keeping current token")
+        return creds
 
 # --- Amazon Q API call ---
 
@@ -186,36 +190,59 @@ def call_api(msgs, model=DEFAULT_MODEL):
     token = bearer_token()
     cid = str(uuid.uuid4())
     history = []
+    pending_system = KIRO_DEFANG + "\n"
+
+    def make_user_msg(content):
+        return {
+            "userInputMessage": {
+                "content": content,
+                "userInputMessageContext": {
+                    "envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}
+                },
+                "origin": "KIRO_CLI", "modelId": model
+            }
+        }
+
     for m in msgs[:-1]:
         r = m.get("role", "user")
-        content = m.get("content", "")
-        if r == "user":
-            history.append({
-                "userInputMessage": {
-                    "content": content,
-                    "userInputMessageContext": {
-                        "envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}
-                    },
-                    "origin": "KIRO_CLI", "modelId": model
-                }
-            })
+        content = m.get("content") or ""
+
+        if r == "system":
+            pending_system += content + "\n"
+        elif r == "user":
+            if pending_system:
+                content = pending_system + content
+                pending_system = ""
+            history.append(make_user_msg(content))
         elif r == "assistant":
+            tc = m.get("tool_calls")
+            if tc:
+                tc_text = "\n".join(
+                    f"[TOOL_CALL: {t['function']['name']}({t['function']['arguments']})]"
+                    for t in tc
+                )
+                content = (content + "\n" + tc_text).strip()
+            if pending_system:
+                content = pending_system + content
+                pending_system = ""
             history.append({"assistantResponseMessage": {"content": content}})
+        elif r == "tool":
+            if pending_system:
+                pending_system = ""
+            history.append(make_user_msg(
+                f"[TOOL_RESULT: {m.get('tool_call_id', '?')}]\n{content}"
+            ))
 
     current = msgs[-1] if msgs else {"role": "user", "content": ""}
+    current_content = current.get("content") or ""
+    if pending_system:
+        current_content = pending_system + current_content
+
     payload = {
         "conversationState": {
             "conversationId": cid,
             "history": history,
-            "currentMessage": {
-                "userInputMessage": {
-                    "content": current.get("content", ""),
-                    "userInputMessageContext": {
-                        "envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}
-                    },
-                    "origin": "KIRO_CLI", "modelId": model
-                }
-            },
+            "currentMessage": make_user_msg(current_content),
             "chatTriggerType": "MANUAL", "agentTaskType": "vibe"
         },
         "profileArn": PROFILE_ARN
