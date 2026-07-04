@@ -208,13 +208,7 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
                 pending_system = ""
             history.append(make_user_msg(content, base_ctx))
         elif r == "assistant":
-            tc = m.get("tool_calls")
-            if tc:
-                tc_text = "\n".join(
-                    f"[TOOL_CALL: {t['function']['name']}({t['function']['arguments']})]"
-                    for t in tc
-                )
-                content = (content + "\n" + tc_text).strip()
+            # tool_calls не пишем в текст — иначе Amazon Q учится имитировать их текстом
             if pending_system:
                 content = pending_system + content
                 pending_system = ""
