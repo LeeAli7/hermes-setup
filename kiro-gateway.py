@@ -177,6 +177,9 @@ def convert_tools(openai_tools):
 def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
     token = bearer_token()
     cid = str(uuid.uuid4())
+    # trim history — keep last 30 msgs for context sanity
+    if len(msgs) > 30:
+        msgs = msgs[-30:]
     history = []
     pending_system = KIRO_DEFANG + "\n"
 
