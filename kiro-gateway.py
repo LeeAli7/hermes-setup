@@ -179,9 +179,10 @@ def convert_tools(openai_tools):
 def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
     token = bearer_token()
 
-    # Stable conversationId from user messages (resets on new prompt, stable during tool rounds)
-    user_texts = [m["content"] for m in msgs if m.get("role") == "user" and isinstance(m.get("content"), str)]
-    cid = hashlib.md5("".join(user_texts).encode()).hexdigest()[:36] if user_texts else str(uuid.uuid4())
+    # Stable conversationId: hash of the first user message in the conversation
+    # Same CID for all turns in a session, resets only when a new conversation starts
+    first_user = next((m["content"] for m in msgs if m.get("role") == "user" and isinstance(m.get("content"), str)), "")
+    cid = hashlib.md5(first_user.encode()).hexdigest()[:36] if first_user else str(uuid.uuid4())
     continuation_id = str(uuid.uuid4())
     history = []
 
@@ -207,8 +208,15 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
     for m in history_msgs:
         r = m.get("role", "user")
         content = m.get("content") or ""
-        if r == "assistant" and m.get("tool_calls") and not content:
-            pending_tc = m["tool_calls"]
+        tc_list = m.get("tool_calls") or []
+        if r == "assistant":
+            if not content and tc_list:
+                pending_tc = tc_list
+                continue
+            if content:
+                history.append({"assistantResponseMessage": {"content": content}})
+            if tc_list:
+                pending_tc = tc_list
             continue
         if r == "tool":
             text = content
@@ -221,13 +229,12 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
                 pending_tc = None
             history.append({"assistantResponseMessage": {"content": text}})
             continue
-        if r == "assistant":
-            history.append({"assistantResponseMessage": {"content": content}})
-        elif r == "user":
+        if r == "user":
             history.append(ui_msg(content))
 
     current = msgs[-1] if msgs else {"role": "user", "content": ""}
-    in_tool_round = current.get("role") == "tool"
+    current_role = current.get("role", "user")
+    in_tool_round = current_role == "tool"
     if in_tool_round:
         text = current.get("content", "")
         if pending_tc:
@@ -239,10 +246,11 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
             pending_tc = None
         history.append({"assistantResponseMessage": {"content": text}})
         current_content = ""
+    elif current_role == "assistant" and current.get("tool_calls"):
+        # Assistant with tool_calls as current — treat as continuation
+        current_content = current.get("content", "") or ""
     else:
         current_content = current.get("content") or ""
-        if not current_content:
-            current_content = ""
 
     ctx = {"envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}}
     kiro_tools = []
