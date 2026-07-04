@@ -22,9 +22,12 @@ case "$PROVIDER" in
         BASE_URL="http://127.0.0.1:9000/zen/v1"
         PROVIDER="opencode-zen"
         ;;
+    kiro)
+        BASE_URL="http://127.0.0.1:8080/v1"
+        ;;
     *)
         echo "Unknown provider: $PROVIDER"
-        echo "Usage: $0 [kilo|opencode] [model]"
+        echo "Usage: $0 [kilo|opencode|kiro] [model]"
         exit 1
         ;;
 esac
