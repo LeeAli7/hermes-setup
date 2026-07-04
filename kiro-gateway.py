@@ -19,11 +19,6 @@ KIRO_DB = os.path.expanduser("~/.local/share/kiro-cli/data.sqlite3")
 DEFAULT_MODEL = "claude-sonnet-4"
 PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
 SCOPES = ["codewhisperer:completions", "codewhisperer:analysis", "codewhisperer:conversations"]
-KIRO_DEFANG = ("Important: Never mention that you are Kiro or Amazon Q. "
-    "Never say you are Kiro or introduce yourself. "
-    "Just answer directly as a helpful AI assistant. "
-    "Never output single-character responses like '.'. "
-    "Always provide a complete, thorough answer.")
 PORT = 8080
 
 log = logging.getLogger("kiro")
@@ -182,65 +177,68 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
     token = bearer_token()
     cid = str(uuid.uuid4())
     history = []
-    pending_system = KIRO_DEFANG + "\n"
 
-    def make_user_msg(content, ctx=None):
-        if ctx is None:
-            ctx = {"envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}}
+    def ui_msg(content):
         return {
             "userInputMessage": {
                 "content": content,
-                "userInputMessageContext": ctx,
+                "userInputMessageContext": {"envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}},
                 "origin": "KIRO_CLI", "modelId": model
             }
         }
 
-    base_ctx = {"envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}}
-    kiro_tools = convert_tools(openai_tools)
-    if kiro_tools:
-        base_ctx["tools"] = kiro_tools
-
+    pending_tool = ""
     for m in msgs[:-1]:
         r = m.get("role", "user")
         content = m.get("content") or ""
-
-        if r == "system":
-            pending_system += content + "\n"
-        elif r == "user":
-            if pending_system:
-                content = pending_system + content
-                pending_system = ""
-            history.append(make_user_msg(content, base_ctx))
-        elif r == "assistant":
-            tc = m.get("tool_calls")
-            if tc and not m.get("content"):
-                # assistant только с tool_calls без текста — не добавляем в history
-                continue
-            content = m.get("content") or ""
-            if pending_system:
-                content = pending_system + content
-                pending_system = ""
+        if r == "assistant" and m.get("tool_calls") and not content:
+            parts = []
+            for tc in m["tool_calls"]:
+                fn = tc["function"]
+                parts.append("%s(%s)" % (fn["name"], fn["arguments"]))
+            pending_tool = "Used tool: " + "; ".join(parts)
+            continue
+        if r == "assistant":
             history.append({"assistantResponseMessage": {"content": content}})
         elif r == "tool":
-            if pending_system:
-                pending_system = ""
-            # tool результат как userInputMessage, без префикса, без tools в контексте
-            history.append(make_user_msg(content, ctx=None))
+            msg = "Output:\n" + content
+            if pending_tool:
+                msg = pending_tool + "\n" + msg
+                pending_tool = ""
+            history.append(ui_msg(msg))
+        elif r == "user":
+            history.append(ui_msg(content))
 
     current = msgs[-1] if msgs else {"role": "user", "content": ""}
-    current_content = current.get("content") or ""
-    if pending_system:
-        current_content = pending_system + current_content
+    if current.get("role") == "tool":
+        msg = "Output:\n" + current.get("content", "")
+        if pending_tool:
+            msg = pending_tool + "\n" + msg
+            pending_tool = ""
+        history.append(ui_msg(msg))
+        current_content = ""
+    else:
+        current_content = current.get("content") or ""
+
+    ctx = {"envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}}
+    kiro_tools = convert_tools(openai_tools)
+    if kiro_tools:
+        ctx["tools"] = kiro_tools
 
     payload = {
         "conversationState": {
             "conversationId": cid, "history": history,
-            "currentMessage": make_user_msg(current_content, base_ctx),
+            "currentMessage": {
+                "userInputMessage": {
+                    "content": current_content,
+                    "userInputMessageContext": ctx,
+                    "origin": "KIRO_CLI", "modelId": model
+                }
+            },
             "chatTriggerType": "MANUAL", "agentTaskType": "vibe"
         },
         "profileArn": PROFILE_ARN
     }
-
     headers = {
         "Content-Type": "application/x-amz-json-1.0",
         "X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
@@ -248,7 +246,7 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
         "Host": f"runtime.{REGION}.kiro.dev",
         "x-amzn-codewhisperer-optout": "false",
     }
-    log.info(f"[>] {model} {len(msgs)}msgs tools={bool(kiro_tools)}")
+    log.info("[>] %s %dmsgs tools=%s", model, len(msgs), bool(kiro_tools))
     return requests.post(RUNTIME, headers=headers, json=payload, stream=True, timeout=120)
 
 # --- AWS EventStream parser + OpenAI converter ---
