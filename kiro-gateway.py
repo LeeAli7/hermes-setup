@@ -5,7 +5,7 @@ Kiro Gateway — OpenAI-совместимый прокси для Amazon Q Deve
 
 Зависимости: pip install requests boto3
 """
-import json, os, time, uuid, logging, struct, socket, sys, webbrowser
+import json, os, time, uuid, logging, struct, socket, sys, webbrowser, hashlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from datetime import datetime, timezone
@@ -177,11 +177,11 @@ def convert_tools(openai_tools):
 # --- API call ---
 
 def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
-    global _kiro_conversation_id
     token = bearer_token()
-    if not _kiro_conversation_id:
-        _kiro_conversation_id = str(uuid.uuid4())
-    cid = _kiro_conversation_id
+
+    # Stable conversationId from user messages (resets on new prompt, stable during tool rounds)
+    user_texts = [m["content"] for m in msgs if m.get("role") == "user" and isinstance(m.get("content"), str)]
+    cid = hashlib.md5("".join(user_texts).encode()).hexdigest()[:36] if user_texts else str(uuid.uuid4())
     continuation_id = str(uuid.uuid4())
     history = []
 
@@ -194,8 +194,17 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
             }
         }
 
+    # Trim to last 10 turns (max 20 messages) to avoid END_TURN from accumulated history
+    history_msgs = msgs[:-1]
+    if len(history_msgs) > 20:
+        # Rewind to ensure we don't start mid-tool-round
+        trim_start = len(history_msgs) - 20
+        while trim_start > 0 and history_msgs[trim_start].get("role") == "tool":
+            trim_start -= 1
+        history_msgs = history_msgs[trim_start:]
+
     pending_tc = None
-    for m in msgs[:-1]:
+    for m in history_msgs:
         r = m.get("role", "user")
         content = m.get("content") or ""
         if r == "assistant" and m.get("tool_calls") and not content:
@@ -252,7 +261,7 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
                     "origin": "KIRO_CLI", "modelId": model
                 }
             },
-            "chatTriggerType": "MANUAL", "agentContinuationId": continuation_id, "agentTaskType": "vibe"
+            "chatTriggerType": "MANUAL", "agentContinuationId": continuation_id, "agentTaskType": "AGENTIC_REQUEST"
         },
         "profileArn": PROFILE_ARN
     }
