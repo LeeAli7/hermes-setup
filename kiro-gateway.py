@@ -174,107 +174,131 @@ def convert_tools(openai_tools):
         })
     return kiro_tools
 
+
+def _tool_calls_to_kiro(tc_list):
+    """OpenAI tool_calls -> Kiro toolUses with name/input/toolUseId."""
+    result = []
+    for tc in tc_list:
+        fn = tc.get("function", tc)
+        args_str = fn.get("arguments", "{}")
+        if isinstance(args_str, str):
+            try:
+                args = json.loads(args_str)
+            except json.JSONDecodeError:
+                args = {"_raw": args_str}
+        else:
+            args = args_str or {}
+        result.append({
+            "name": fn.get("name", "unknown"),
+            "input": args,
+            "toolUseId": tc.get("id", "")
+        })
+    return result
+
+
+def _make_ui(content, model, tools_ctx=None, tool_results=None):
+    """Build a userInputMessage dict for Kiro."""
+    msg = {
+        "content": content or "(empty placeholder)",
+        "modelId": model,
+        "origin": "KIRO_CLI",
+        "userInputMessageContext": {"envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}}
+    }
+    ctx = msg["userInputMessageContext"]
+    if tools_ctx:
+        ctx["tools"] = tools_ctx
+    if tool_results:
+        ctx["toolResults"] = tool_results
+    return {"userInputMessage": msg}
+
+
+def _make_tool_results(tool_call_id, content):
+    """Build a toolResults list entry for Kiro."""
+    return [{
+        "toolUseId": tool_call_id,
+        "content": [{"text": content or "(empty result)"}],
+        "status": "success"
+    }]
+
+
 # --- API call ---
 
 def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
     token = bearer_token()
 
-    # Stable conversationId: hash of the first user message in the conversation
-    # Same CID for all turns in a session, resets only when a new conversation starts
     first_user = next((m["content"] for m in msgs if m.get("role") == "user" and isinstance(m.get("content"), str)), "")
     cid = hashlib.md5(first_user.encode()).hexdigest()[:36] if first_user else str(uuid.uuid4())
-    continuation_id = str(uuid.uuid4())
     history = []
+    kiro_tools = convert_tools(openai_tools)
 
-    def ui_msg(content):
-        return {
-            "userInputMessage": {
-                "content": content,
-                "userInputMessageContext": {"envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}},
-                "origin": "KIRO_CLI", "modelId": model
-            }
-        }
-
-    # Trim to last 10 turns (max 20 messages) to avoid END_TURN from accumulated history
-    history_msgs = msgs[:-1]
-    if len(history_msgs) > 20:
-        # Rewind to ensure we don't start mid-tool-round
-        trim_start = len(history_msgs) - 20
-        while trim_start > 0 and history_msgs[trim_start].get("role") == "tool":
-            trim_start -= 1
-        history_msgs = history_msgs[trim_start:]
-
-    pending_tc = None
-    for m in history_msgs:
-        r = m.get("role", "user")
+    # Build history (all messages except the last one)
+    pending_tool_results = []
+    for m in msgs[:-1]:
+        role = m.get("role", "user")
         content = m.get("content") or ""
         tc_list = m.get("tool_calls") or []
-        if r == "assistant":
-            if not content and tc_list:
-                pending_tc = tc_list
-                continue
-            if content:
-                history.append({"assistantResponseMessage": {"content": content}})
-            if tc_list:
-                pending_tc = tc_list
-            continue
-        if r == "tool":
-            text = content
-            if pending_tc:
-                parts = []
-                for tc in pending_tc:
-                    fn = tc.get("function", tc)
-                    parts.append("%s(%s)" % (fn.get("name", "unknown"), fn.get("arguments", "{}")))
-                text = "I called " + "; ".join(parts) + " and got:\n" + text
-                pending_tc = None
-            history.append({"assistantResponseMessage": {"content": text}})
-            continue
-        if r == "user":
-            history.append(ui_msg(content))
 
+        if role == "tool":
+            pending_tool_results.append({
+                "toolUseId": m.get("tool_call_id", ""),
+                "content": [{"text": content or "(empty result)"}],
+                "status": "success"
+            })
+            continue
+
+        # Flush accumulated tool results before a non-tool message
+        if pending_tool_results:
+            history.append(_make_ui("", model, kiro_tools, pending_tool_results))
+            pending_tool_results = []
+
+        if role == "assistant":
+            entry = {"assistantResponseMessage": {"content": content or ""}}
+            if tc_list:
+                entry["assistantResponseMessage"]["toolUses"] = _tool_calls_to_kiro(tc_list)
+            history.append(entry)
+
+        elif role == "user":
+            history.append(_make_ui(content, model, kiro_tools))
+
+    # Flush any tool results remaining from history
+    if pending_tool_results:
+        history.append(_make_ui("", model, kiro_tools, pending_tool_results))
+        pending_tool_results = []
+
+    # Handle current message (last one)
     current = msgs[-1] if msgs else {"role": "user", "content": "continue"}
     current_role = current.get("role", "user")
-    in_tool_round = current_role == "tool"
-    if in_tool_round:
-        tool_content = current.get("content", "")
-        if pending_tc:
-            parts = []
-            for tc in pending_tc:
-                fn = tc.get("function", tc)
-                parts.append("%s(%s)" % (fn.get("name", "unknown"), fn.get("arguments", "{}")))
-            tool_content = "I called " + "; ".join(parts) + " and got:\n" + tool_content
-            pending_tc = None
-        # Store tool result in history as assistant content
-        history.append({"assistantResponseMessage": {"content": tool_content}})
-        # Give model an explicit prompt to continue
-        current_content = "continue"
-    elif current_role == "assistant" and current.get("tool_calls"):
-        current_content = current.get("content", "") or ""
+
+    if current_role == "tool":
+        tr = _make_tool_results(current.get("tool_call_id", ""), current.get("content", ""))
+        current_msg = _make_ui("continue", model, kiro_tools, tr)
+
+    elif current_role == "assistant":
+        tc_list = current.get("tool_calls") or []
+        entry = {"assistantResponseMessage": {"content": current.get("content") or ""}}
+        if tc_list:
+            entry["assistantResponseMessage"]["toolUses"] = _tool_calls_to_kiro(tc_list)
+        history.append(entry)
+        current_msg = _make_ui("continue", model, kiro_tools)
+
     else:
         current_content = current.get("content") or ""
         if not current_content.strip():
-            log.info("Empty user message, setting default 'continue'")
             current_content = "continue"
+        current_msg = _make_ui(current_content, model, kiro_tools)
 
-    ctx = {"envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}}
-    kiro_tools = convert_tools(openai_tools)
-    if kiro_tools:
-        ctx["tools"] = kiro_tools
-
+    # Build final payload
     payload = {
         "conversationState": {
-            "conversationId": cid, "history": history,
-            "currentMessage": {
-                "userInputMessage": {
-                    "content": current_content,
-                    "userInputMessageContext": ctx,
-                    "origin": "KIRO_CLI", "modelId": model
-                }
-            },
-            "chatTriggerType": "MANUAL", "agentContinuationId": continuation_id, "agentTaskType": "vibe"
-        },
-        "profileArn": PROFILE_ARN
+            "conversationId": cid,
+            "history": history,
+            "currentMessage": current_msg,
+            "chatTriggerType": "MANUAL"
+        }
     }
+    if PROFILE_ARN:
+        payload["profileArn"] = PROFILE_ARN
+
     headers = {
         "Content-Type": "application/x-amz-json-1.0",
         "X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
@@ -282,7 +306,8 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
         "Host": f"runtime.{REGION}.kiro.dev",
         "x-amzn-codewhisperer-optout": "false",
     }
-    log.info("[>] %s %dmsgs tools=%s cid=%s in_tool_round=%s cur_msg='%s'", model, len(msgs), bool(kiro_tools), cid[:12], in_tool_round, current_content[:50])
+    cur_preview = current_msg.get("userInputMessage", {}).get("content", "")[:50]
+    log.info("[>] %s %dmsgs cid=%s cur='%s' his=%d", model, len(msgs), cid[:12], cur_preview, len(history))
     log.info("  -> payload: %s", json.dumps(payload, indent=2)[:2000])
     resp = requests.post(RUNTIME, headers=headers, json=payload, stream=True, timeout=120)
     if resp.status_code != 200:
