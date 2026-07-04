@@ -177,10 +177,8 @@ def convert_tools(openai_tools):
 def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
     token = bearer_token()
     cid = str(uuid.uuid4())
-    # trim history — keep last 30 msgs for context sanity
-    if len(msgs) > 30:
-        msgs = msgs[-30:]
     history = []
+    pending_tool_result = False
     pending_system = KIRO_DEFANG + "\n"
 
     def make_user_msg(content, ctx=None):
@@ -211,18 +209,31 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
                 pending_system = ""
             history.append(make_user_msg(content, base_ctx))
         elif r == "assistant":
-            # tool_calls не пишем в текст — иначе Amazon Q учится имитировать их текстом
+            tc = m.get("tool_calls")
+            if tc and not m.get("content"):
+                # пустой assistant с tool_calls — скипаем, следующий tool пришьём как assistant
+                pending_tool_result = True
+                continue
+            content = m.get("content") or ""
             if pending_system:
                 content = pending_system + content
                 pending_system = ""
             history.append({"assistantResponseMessage": {"content": content}})
         elif r == "tool":
-            if pending_system:
-                pending_system = ""
-            history.append(make_user_msg(
-                f"[Tool result for {m.get('tool_call_id', '')}]: {content}",
-                base_ctx
-            ))
+            if pending_tool_result:
+                # tool результат шьём как assistantResponseMessage вместо user
+                pending_tool_result = False
+                if pending_system:
+                    content = pending_system + content
+                    pending_system = ""
+                history.append({"assistantResponseMessage": {"content": content}})
+            else:
+                if pending_system:
+                    pending_system = ""
+                history.append(make_user_msg(
+                    f"[Tool result for {m.get('tool_call_id', '')}]: {content}",
+                    base_ctx
+                ))
 
     current = msgs[-1] if msgs else {"role": "user", "content": ""}
     current_content = current.get("content") or ""
