@@ -261,7 +261,7 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
                     "origin": "KIRO_CLI", "modelId": model
                 }
             },
-            "chatTriggerType": "MANUAL", "agentContinuationId": continuation_id, "agentTaskType": "AGENTIC_REQUEST"
+            "chatTriggerType": "MANUAL", "agentContinuationId": continuation_id, "agentTaskType": "vibe"
         },
         "profileArn": PROFILE_ARN
     }
