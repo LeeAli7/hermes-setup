@@ -223,8 +223,8 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
             if pending_tc:
                 parts = []
                 for tc in pending_tc:
-                    fn = tc["function"]
-                    parts.append("%s(%s)" % (fn["name"], fn["arguments"]))
+                    fn = tc.get("function", tc)
+                    parts.append("%s(%s)" % (fn.get("name", "unknown"), fn.get("arguments", "{}")))
                 text = "I called " + "; ".join(parts) + " and got:\n" + text
                 pending_tc = None
             history.append({"assistantResponseMessage": {"content": text}})
@@ -232,7 +232,7 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
         if r == "user":
             history.append(ui_msg(content))
 
-    current = msgs[-1] if msgs else {"role": "user", "content": ""}
+    current = msgs[-1] if msgs else {"role": "user", "content": "continue"}
     current_role = current.get("role", "user")
     in_tool_round = current_role == "tool"
     if in_tool_round:
@@ -240,17 +240,19 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
         if pending_tc:
             parts = []
             for tc in pending_tc:
-                fn = tc["function"]
-                parts.append("%s(%s)" % (fn["name"], fn["arguments"]))
+                fn = tc.get("function", tc)
+                parts.append("%s(%s)" % (fn.get("name", "unknown"), fn.get("arguments", "{}")))
             text = "I called " + "; ".join(parts) + " and got:\n" + text
             pending_tc = None
         history.append({"assistantResponseMessage": {"content": text}})
         current_content = ""
     elif current_role == "assistant" and current.get("tool_calls"):
-        # Assistant with tool_calls as current — treat as continuation
         current_content = current.get("content", "") or ""
     else:
         current_content = current.get("content") or ""
+        if not current_content.strip():
+            log.info("Empty user message, setting default 'continue'")
+            current_content = "continue"
 
     ctx = {"envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}}
     kiro_tools = []
