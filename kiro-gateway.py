@@ -410,19 +410,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _stream(self, model, msgs, tools):
         resp = call_api(msgs, model, tools)
-        events = list(parse_events(resp.iter_content(chunk_size=4096)))
-        content = ""
-        has_tools = False
-        for etype, data in events:
-            if etype == "assistantResponseEvent":
-                content += data.get("content", "")
-            elif etype == "toolUseEvent":
-                has_tools = True
-        if content.strip() in (".", "") and not has_tools:
-            retry_msgs = msgs + [{"role": "user", "content": "Please complete your response properly."}]
-            resp = call_api(retry_msgs, model, openai_tools=None)
-            events = list(parse_events(resp.iter_content(chunk_size=4096)))
-
         self.send_response(200)
         self.send_header("Content-Type","text/event-stream")
         self.send_header("Cache-Control","no-cache")
@@ -443,7 +430,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(d)}\n\n".encode()); self.wfile.flush()
             sent_role = True
 
-        for etype, data in events:
+        for etype, data in parse_events(resp.iter_content(chunk_size=4096)):
             if etype == "assistantResponseEvent":
                 text = data.get("content", "")
                 if text:
