@@ -5,7 +5,7 @@ Kiro Gateway — OpenAI-совместимый прокси для Amazon Q Deve
 
 Зависимости: pip install requests boto3
 """
-import json, os, time, uuid, logging, struct, socket, sys, webbrowser, hashlib
+import json, os, time, uuid, logging, struct, socket, sys, webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from datetime import datetime, timezone
@@ -23,6 +23,9 @@ PORT = 8080
 
 log = logging.getLogger("kiro")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+# --- session state (Amazon Q requires persistent conversationId) ---
+_kiro_conversation_id = None
 
 MODELS = [
     {"id":"qwen3-coder-next","owned_by":"kiro"},
@@ -174,15 +177,13 @@ def convert_tools(openai_tools):
 # --- API call ---
 
 def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
+    global _kiro_conversation_id
     token = bearer_token()
+    if not _kiro_conversation_id:
+        _kiro_conversation_id = str(uuid.uuid4())
+    cid = _kiro_conversation_id
+    continuation_id = str(uuid.uuid4())
     history = []
-
-    # stable conversationId от первого user-сообщения
-    cid = str(uuid.uuid4())
-    for m in msgs:
-        if m.get("role") == "user" and m.get("content"):
-            cid = hashlib.md5(m["content"].encode()).hexdigest()[:36]
-            break
 
     def ui_msg(content):
         return {
@@ -193,43 +194,53 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
             }
         }
 
-    pending_tool = ""
+    pending_tc = None
     for m in msgs[:-1]:
         r = m.get("role", "user")
         content = m.get("content") or ""
         if r == "assistant" and m.get("tool_calls") and not content:
-            parts = []
-            for tc in m["tool_calls"]:
-                fn = tc["function"]
-                parts.append("%s(%s)" % (fn["name"], fn["arguments"]))
-            pending_tool = "Used tool: " + "; ".join(parts)
+            pending_tc = m["tool_calls"]
+            continue
+        if r == "tool":
+            text = content
+            if pending_tc:
+                parts = []
+                for tc in pending_tc:
+                    fn = tc["function"]
+                    parts.append("%s(%s)" % (fn["name"], fn["arguments"]))
+                text = "I called " + "; ".join(parts) + " and got:\n" + text
+                pending_tc = None
+            history.append({"assistantResponseMessage": {"content": text}})
             continue
         if r == "assistant":
             history.append({"assistantResponseMessage": {"content": content}})
-        elif r == "tool":
-            msg = "Output:\n" + content
-            if pending_tool:
-                msg = pending_tool + "\n" + msg
-                pending_tool = ""
-            history.append(ui_msg(msg))
         elif r == "user":
             history.append(ui_msg(content))
 
     current = msgs[-1] if msgs else {"role": "user", "content": ""}
-    if current.get("role") == "tool":
-        msg = "Output:\n" + current.get("content", "")
-        if pending_tool:
-            msg = pending_tool + "\n" + msg
-            pending_tool = ""
-        history.append(ui_msg(msg))
+    in_tool_round = current.get("role") == "tool"
+    if in_tool_round:
+        text = current.get("content", "")
+        if pending_tc:
+            parts = []
+            for tc in pending_tc:
+                fn = tc["function"]
+                parts.append("%s(%s)" % (fn["name"], fn["arguments"]))
+            text = "I called " + "; ".join(parts) + " and got:\n" + text
+            pending_tc = None
+        history.append({"assistantResponseMessage": {"content": text}})
         current_content = ""
     else:
         current_content = current.get("content") or ""
+        if not current_content:
+            current_content = ""
 
     ctx = {"envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}}
-    kiro_tools = convert_tools(openai_tools)
-    if kiro_tools:
-        ctx["tools"] = kiro_tools
+    kiro_tools = []
+    if not in_tool_round:
+        kiro_tools = convert_tools(openai_tools)
+        if kiro_tools:
+            ctx["tools"] = kiro_tools
 
     payload = {
         "conversationState": {
@@ -241,7 +252,7 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
                     "origin": "KIRO_CLI", "modelId": model
                 }
             },
-            "chatTriggerType": "MANUAL", "agentTaskType": "vibe"
+            "chatTriggerType": "MANUAL", "agentContinuationId": continuation_id, "agentTaskType": "vibe"
         },
         "profileArn": PROFILE_ARN
     }
@@ -284,7 +295,9 @@ def parse_events(raw_iter):
                 data = json.loads(pbytes.decode()) if pbytes else {}
             except json.JSONDecodeError:
                 data = {"_raw": pbytes.decode(errors="replace")}
-            yield hdrs.get(":event-type", "unknown"), data
+            etype = hdrs.get(":event-type", "unknown")
+            log.info("EVENT: %s -> %s", etype, data)
+            yield etype, data
 
 class ToolCallAccumulator:
     """Accumulates streamed toolUseEvent chunks into complete tool calls."""
@@ -402,17 +415,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._stream(model, msgs, tools)
             else:
                 resp = call_api(msgs, model, tools)
-                result = build_response(parse_events(resp.iter_content(chunk_size=4096)), model)
-                msg = result["choices"][0]["message"]
-                content = msg.get("content", "")
-                if content.strip() in (".", "") and result["choices"][0]["finish_reason"] == "stop" and not msg.get("tool_calls"):
-                    retry_msgs = msgs + [{"role": "user", "content": "Please complete your response properly."}]
-                    resp2 = call_api(retry_msgs, model, openai_tools=None)
-                    result = build_response(parse_events(resp2.iter_content(chunk_size=4096)), model)
+                events = list(parse_events(resp.iter_content(chunk_size=4096)))
+                self._update_session(events)
+                result = build_response(events, model)
                 self._json(result)
         except Exception as e:
             log.error(f"ERR: {e}")
             self._json({"error":str(e)},500)
+
+    def _update_session(self, events):
+        pass
 
     def _stream(self, model, msgs, tools):
         resp = call_api(msgs, model, tools)
@@ -465,6 +477,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     finish_reason = "tool_calls"
                 elif sr == "END_TURN":
                     finish_reason = "stop"
+                if "conversationId" in data or "agentContinuationId" in data:
+                    self._update_session([(etype, data)])
 
         emit({}, fr=finish_reason)
         self.wfile.write(b"data: [DONE]\n\n")
