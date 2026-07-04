@@ -5,3 +5,5 @@ gateway_state.json
 logs/
 tor/Data/
 tor/tor.log
+__pycache__/
+tor/tor-start.log
