@@ -5,7 +5,7 @@ Kiro Gateway — OpenAI-совместимый прокси для Amazon Q Deve
 
 Зависимости: pip install requests boto3
 """
-import json, os, time, uuid, logging, struct, socket, sys, webbrowser
+import json, os, time, uuid, logging, struct, socket, sys, webbrowser, hashlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from datetime import datetime, timezone
@@ -175,8 +175,14 @@ def convert_tools(openai_tools):
 
 def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
     token = bearer_token()
-    cid = str(uuid.uuid4())
     history = []
+
+    # stable conversationId от первого user-сообщения
+    cid = str(uuid.uuid4())
+    for m in msgs:
+        if m.get("role") == "user" and m.get("content"):
+            cid = hashlib.md5(m["content"].encode()).hexdigest()[:36]
+            break
 
     def ui_msg(content):
         return {
