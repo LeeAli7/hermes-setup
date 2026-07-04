@@ -19,7 +19,11 @@ KIRO_DB = os.path.expanduser("~/.local/share/kiro-cli/data.sqlite3")
 DEFAULT_MODEL = "claude-sonnet-4"
 PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
 SCOPES = ["codewhisperer:completions", "codewhisperer:analysis", "codewhisperer:conversations"]
-KIRO_DEFANG = "Important: Never mention that you are Kiro or Amazon Q. Never say 'I\'m Kiro' or introduce yourself. Just answer directly as a helpful AI assistant."
+KIRO_DEFANG = ("Important: Never mention that you are Kiro or Amazon Q. "
+    "Never say you are Kiro or introduce yourself. "
+    "Just answer directly as a helpful AI assistant. "
+    "Never output single-character responses like '.'. "
+    "Always provide a complete, thorough answer.")
 PORT = 8080
 
 log = logging.getLogger("kiro")
@@ -178,7 +182,6 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
     token = bearer_token()
     cid = str(uuid.uuid4())
     history = []
-    pending_tool_result = False
     pending_system = KIRO_DEFANG + "\n"
 
     def make_user_msg(content, ctx=None):
@@ -211,8 +214,7 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
         elif r == "assistant":
             tc = m.get("tool_calls")
             if tc and not m.get("content"):
-                # пустой assistant с tool_calls — скипаем, следующий tool пришьём как assistant
-                pending_tool_result = True
+                # assistant только с tool_calls без текста — не добавляем в history
                 continue
             content = m.get("content") or ""
             if pending_system:
@@ -220,20 +222,10 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
                 pending_system = ""
             history.append({"assistantResponseMessage": {"content": content}})
         elif r == "tool":
-            if pending_tool_result:
-                # tool результат шьём как assistantResponseMessage вместо user
-                pending_tool_result = False
-                if pending_system:
-                    content = pending_system + content
-                    pending_system = ""
-                history.append({"assistantResponseMessage": {"content": content}})
-            else:
-                if pending_system:
-                    pending_system = ""
-                history.append(make_user_msg(
-                    f"[Tool result for {m.get('tool_call_id', '')}]: {content}",
-                    base_ctx
-                ))
+            if pending_system:
+                pending_system = ""
+            # tool результат как userInputMessage, без префикса, без tools в контексте
+            history.append(make_user_msg(content, ctx=None))
 
     current = msgs[-1] if msgs else {"role": "user", "content": ""}
     current_content = current.get("content") or ""
@@ -407,6 +399,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             else:
                 resp = call_api(msgs, model, tools)
                 result = build_response(parse_events(resp.iter_content(chunk_size=4096)), model)
+                msg = result["choices"][0]["message"]
+                content = msg.get("content", "")
+                if content.strip() in (".", "") and result["choices"][0]["finish_reason"] == "stop" and not msg.get("tool_calls"):
+                    retry_msgs = msgs + [{"role": "user", "content": "Please complete your response properly."}]
+                    resp2 = call_api(retry_msgs, model, openai_tools=None)
+                    result = build_response(parse_events(resp2.iter_content(chunk_size=4096)), model)
                 self._json(result)
         except Exception as e:
             log.error(f"ERR: {e}")
@@ -414,6 +412,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _stream(self, model, msgs, tools):
         resp = call_api(msgs, model, tools)
+        events = list(parse_events(resp.iter_content(chunk_size=4096)))
+        content = ""
+        has_tools = False
+        for etype, data in events:
+            if etype == "assistantResponseEvent":
+                content += data.get("content", "")
+            elif etype == "toolUseEvent":
+                has_tools = True
+        if content.strip() in (".", "") and not has_tools:
+            retry_msgs = msgs + [{"role": "user", "content": "Please complete your response properly."}]
+            resp = call_api(retry_msgs, model, openai_tools=None)
+            events = list(parse_events(resp.iter_content(chunk_size=4096)))
+
         self.send_response(200)
         self.send_header("Content-Type","text/event-stream")
         self.send_header("Cache-Control","no-cache")
@@ -434,7 +445,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(d)}\n\n".encode()); self.wfile.flush()
             sent_role = True
 
-        for etype, data in parse_events(resp.iter_content(chunk_size=4096)):
+        for etype, data in events:
             if etype == "assistantResponseEvent":
                 text = data.get("content", "")
                 if text:
