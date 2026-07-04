@@ -236,16 +236,18 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
     current_role = current.get("role", "user")
     in_tool_round = current_role == "tool"
     if in_tool_round:
-        text = current.get("content", "")
+        tool_content = current.get("content", "")
         if pending_tc:
             parts = []
             for tc in pending_tc:
                 fn = tc.get("function", tc)
                 parts.append("%s(%s)" % (fn.get("name", "unknown"), fn.get("arguments", "{}")))
-            text = "I called " + "; ".join(parts) + " and got:\n" + text
+            tool_content = "I called " + "; ".join(parts) + " and got:\n" + tool_content
             pending_tc = None
-        history.append({"assistantResponseMessage": {"content": text}})
-        current_content = ""
+        # Store tool result in history as assistant content
+        history.append({"assistantResponseMessage": {"content": tool_content}})
+        # Give model an explicit prompt to continue
+        current_content = "continue"
     elif current_role == "assistant" and current.get("tool_calls"):
         current_content = current.get("content", "") or ""
     else:
@@ -255,11 +257,9 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
             current_content = "continue"
 
     ctx = {"envState": {"operatingSystem": "linux", "currentWorkingDirectory": os.getcwd()}}
-    kiro_tools = []
-    if not in_tool_round:
-        kiro_tools = convert_tools(openai_tools)
-        if kiro_tools:
-            ctx["tools"] = kiro_tools
+    kiro_tools = convert_tools(openai_tools)
+    if kiro_tools:
+        ctx["tools"] = kiro_tools
 
     payload = {
         "conversationState": {
