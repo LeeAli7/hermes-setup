@@ -158,6 +158,12 @@ class Proxy(BaseHTTPRequestHandler):
         status, data = self._upstream_post("/chat/completions", oa_body)
 
         if status != 200:
+            err_msg = data.get("error", {})
+            if isinstance(err_msg, str):
+                err_msg = data.get("error", str(data))
+            elif isinstance(err_msg, dict):
+                err_msg = err_msg.get("message", str(data))
+            logging.warning(f"Upstream {status} for model={model}: {err_msg}")
             self.send_json(status, data)
             return
 
@@ -259,11 +265,14 @@ class Proxy(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length))
 
     def send_json(self, status, data):
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            pass
 
     def log_message(self, format, *args):
         pass
