@@ -161,7 +161,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             try:
                 resp = requests.request(
                     method=method, url=url, data=body, headers=headers,
-                    proxies=proxy, timeout=(10, 60), stream=True, verify=False,
+                    proxies=proxy, timeout=(60, 300), stream=True, verify=False,
                 )
                 log.info(f"Response: {resp.status_code} for {self.path} attempt={attempt+1}")
 
@@ -225,8 +225,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 9001
-    server = ThreadingHTTPServer(("127.0.0.1", port), ProxyHandler)
-    log.info(f"Kilo forwarder started on port {port}")
+    host = os.environ.get("FORWARDER_HOST", "0.0.0.0")
+    server = ThreadingHTTPServer((host, port), ProxyHandler)
+    log.info(f"Kilo forwarder started on {host}:{port}")
     server.serve_forever()
 
 

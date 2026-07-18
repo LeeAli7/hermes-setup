@@ -22,7 +22,7 @@ UPSTREAM_BASE = "https://opencode.ai"
 CONTROL_PORT = 9051
 SOCKS_PORT = 9050
 UPSTREAM_READ_TIMEOUT = 300  # upstream response timeout (seconds)
-UPSTREAM_CONNECT_TIMEOUT = 10
+UPSTREAM_CONNECT_TIMEOUT = 60
 
 FORBIDDEN_HEADERS = {"host", "content-length", "transfer-encoding", "connection", "accept-encoding"}
 
@@ -227,8 +227,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 9000
-    server = ThreadingHTTPServer(("127.0.0.1", port), ProxyHandler)
-    log.info(f"Forwarder started on port {port}")
+    host = os.environ.get("FORWARDER_HOST", "0.0.0.0")
+    server = ThreadingHTTPServer((host, port), ProxyHandler)
+    log.info(f"Forwarder started on {host}:{port}")
     server.serve_forever()
 
 

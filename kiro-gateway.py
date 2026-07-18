@@ -228,6 +228,7 @@ def call_api(msgs, model=DEFAULT_MODEL, openai_tools=None):
 
     first_user = next((m["content"] for m in msgs if m.get("role") == "user" and isinstance(m.get("content"), str)), "")
     cid = hashlib.md5(first_user.encode()).hexdigest()[:36] if first_user else str(uuid.uuid4())
+    # Stable continuation ID per conversation — tells Kiro this is same turn chain
     history = []
     kiro_tools = convert_tools(openai_tools)
 
@@ -465,6 +466,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._stream(model, msgs, tools)
             else:
                 resp = call_api(msgs, model, tools)
+                if resp.status_code != 200:
+                    err_msg = resp.text[:500]
+                    log.error("Kiro API error %d: %s", resp.status_code, err_msg)
+                    self._json({"error": f"Upstream API error {resp.status_code}: {err_msg}"}, resp.status_code)
+                    return
                 events = list(parse_events(resp.iter_content(chunk_size=4096)))
                 self._update_session(events)
                 result = build_response(events, model)
@@ -478,6 +484,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _stream(self, model, msgs, tools):
         resp = call_api(msgs, model, tools)
+        if resp.status_code != 200:
+            err_body = resp.text[:500]
+            log.error("Kiro API error %d: %s", resp.status_code, err_body)
+            self.send_response(resp.status_code)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Access-Control-Allow-Origin","*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"Upstream API error {resp.status_code}: {err_body}"}).encode())
+            return
         self.send_response(200)
         self.send_header("Content-Type","text/event-stream")
         self.send_header("Cache-Control","no-cache")
