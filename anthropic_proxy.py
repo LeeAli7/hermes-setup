@@ -188,10 +188,11 @@ class Proxy(BaseHTTPRequestHandler):
 
             reasoning = msg.get("reasoning_content")
             content = msg.get("content")
+            has_tool_calls = bool(msg.get("tool_calls"))
 
             if reasoning:
                 content_blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
-            if content:
+            if content and not has_tool_calls:
                 content_blocks.append({"type": "text", "text": content})
 
             for tc in (msg.get("tool_calls") or []):
