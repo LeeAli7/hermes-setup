@@ -19,36 +19,82 @@ def upstream_headers():
     }
 
 
-def anthropic_content_to_openai(content):
-    if isinstance(content, str):
-        return content
-    texts = []
-    for block in content:
-        if block.get("type") == "text":
-            texts.append(block["text"])
-        elif block.get("type") == "image":
-            return content
-    return "\n".join(texts)
+def anthropic_tools_to_openai(tools):
+    result = []
+    for tool in tools or []:
+        result.append({
+            "type": "function",
+            "function": {
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {}),
+            },
+        })
+    return result
 
 
-def openai_choice_to_anthropic(choice):
-    msg = choice.get("message", {})
-    content_blocks = []
-    if msg.get("reasoning_content"):
-        content_blocks.append({"type": "text", "text": msg["reasoning_content"]})
-    if msg.get("content"):
-        content_blocks.append({"type": "text", "text": msg["content"]})
-    stop_reason = choice.get("finish_reason", "end_turn")
-    if stop_reason == "stop":
-        stop_reason = "end_turn"
-    elif stop_reason == "length":
-        stop_reason = "max_tokens"
-    return {
-        "type": "message",
-        "role": msg.get("role", "assistant"),
-        "content": content_blocks,
-        "stop_reason": stop_reason,
-    }
+def anthropic_messages_to_openai(messages):
+    result = []
+    for msg in messages or []:
+        role = msg.get("role", "user")
+        content_blocks = msg.get("content", [])
+
+        if isinstance(content_blocks, str):
+            result.append({"role": role, "content": content_blocks})
+            continue
+
+        text_parts = []
+        tool_uses = []
+        tool_results = []
+
+        for block in content_blocks:
+            t = block.get("type")
+            if t == "text":
+                text_parts.append(block["text"])
+            elif t == "image":
+                return None, "Image content in history not supported"
+            elif t == "tool_use":
+                tool_uses.append(block)
+            elif t == "tool_result":
+                tool_results.append(block)
+
+        if role == "assistant" and tool_uses:
+            text = "\n".join(text_parts) if text_parts else None
+            asst = {"role": "assistant", "content": text}
+            asst["tool_calls"] = [
+                {
+                    "id": tu["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tu["name"],
+                        "arguments": json.dumps(tu["input"]),
+                    },
+                }
+                for tu in tool_uses
+            ]
+            result.append(asst)
+            continue
+
+        if tool_results:
+            for tr in tool_results:
+                tr_content = tr.get("content", "")
+                if isinstance(tr_content, list):
+                    tr_text = "\n".join(
+                        b.get("text", "") for b in tr_content if b.get("type") == "text"
+                    )
+                else:
+                    tr_text = str(tr_content)
+                result.append({
+                    "role": "tool",
+                    "tool_call_id": tr["tool_use_id"],
+                    "content": tr_text,
+                })
+            continue
+
+        text = "\n".join(text_parts) if text_parts else ""
+        result.append({"role": role, "content": text})
+
+    return result
 
 
 class Proxy(BaseHTTPRequestHandler):
@@ -82,41 +128,33 @@ class Proxy(BaseHTTPRequestHandler):
     def handle_anthropic(self, body):
         model = body.get("model")
         max_tokens = body.get("max_tokens", 1024)
-        messages = body.get("messages", [])
         system = body.get("system", "")
         temperature = body.get("temperature")
         stop_sequences = body.get("stop_sequences", [])
+        tools = body.get("tools", [])
+        tool_choice = body.get("tool_choice")
 
-        openai_messages = []
-        if system:
-            openai_messages.append({"role": "system", "content": system})
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = anthropic_content_to_openai(msg.get("content", ""))
-            if isinstance(content, list):
-                self.send_json(400, {"error": "Image content not supported via Anthropic proxy"})
-                return
-            openai_messages.append({"role": role, "content": content})
+        oa_msgs = anthropic_messages_to_openai(body.get("messages", []))
+        if isinstance(oa_msgs, tuple):
+            self.send_json(400, {"error": oa_msgs[1]})
+            return
 
-        openai_body = {
+        oa_body = {
             "model": model,
-            "messages": openai_messages,
+            "messages": oa_msgs,
             "max_tokens": max_tokens,
             "stream": False,
         }
         if temperature is not None:
-            openai_body["temperature"] = temperature
+            oa_body["temperature"] = temperature
         if stop_sequences:
-            openai_body["stop"] = stop_sequences
+            oa_body["stop"] = stop_sequences
+        if tools:
+            oa_body["tools"] = anthropic_tools_to_openai(tools)
+        if tool_choice:
+            oa_body["tool_choice"] = tool_choice
 
-        status, data = self._upstream_post("/chat/completions", openai_body)
-
-        if status == 400:
-            err = data.get("error", {}).get("message", str(data))
-            if "upstream request failed" in err.lower() or "model=None" in err:
-                pass
-            self.send_json(status, data)
-            return
+        status, data = self._upstream_post("/chat/completions", oa_body)
 
         if status != 200:
             self.send_json(status, data)
@@ -125,12 +163,7 @@ class Proxy(BaseHTTPRequestHandler):
         choices = data.get("choices", [])
         usage = data.get("usage", {})
 
-        anthropic_usage = {
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
-        }
-
-        response = {
+        resp = {
             "id": data.get("id", ""),
             "type": "message",
             "role": "assistant",
@@ -138,28 +171,49 @@ class Proxy(BaseHTTPRequestHandler):
             "model": model,
             "stop_reason": "end_turn",
             "stop_sequence": None,
-            "usage": anthropic_usage,
+            "usage": {
+                "input_tokens": usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0),
+            },
         }
 
-        content_list = []
+        content_blocks = []
         if choices:
-            choice = choices[0]
-            msg = choice.get("message", {})
+            c = choices[0]
+            msg = c.get("message", {})
+
             reasoning = msg.get("reasoning_content")
             content = msg.get("content")
-            if reasoning:
-                content_list.append({"type": "thinking", "thinking": reasoning, "signature": ""})
-            if content:
-                content_list.append({"type": "text", "text": content})
-            stop_reason = choice.get("finish_reason", "end_turn")
-            if stop_reason == "stop":
-                stop_reason = "end_turn"
-            elif stop_reason == "length":
-                stop_reason = "max_tokens"
-            response["stop_reason"] = stop_reason
 
-        response["content"] = content_list if content_list else [{"type": "text", "text": ""}]
-        self.send_json(200, response)
+            if reasoning:
+                content_blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
+            if content:
+                content_blocks.append({"type": "text", "text": content})
+
+            for tc in (msg.get("tool_calls") or []):
+                try:
+                    args = json.loads(tc["function"]["arguments"])
+                except (json.JSONDecodeError, KeyError):
+                    args = {}
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "input": args,
+                })
+
+            finish = c.get("finish_reason", "end_turn")
+            if finish == "stop":
+                resp["stop_reason"] = "end_turn"
+            elif finish == "length":
+                resp["stop_reason"] = "max_tokens"
+            elif finish == "tool_calls":
+                resp["stop_reason"] = "tool_use"
+            else:
+                resp["stop_reason"] = "end_turn"
+
+        resp["content"] = content_blocks if content_blocks else [{"type": "text", "text": ""}]
+        self.send_json(200, resp)
 
     def proxy_get(self, path):
         try:
@@ -169,8 +223,7 @@ class Proxy(BaseHTTPRequestHandler):
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read())
-                self.send_json(resp.status, data)
+                self.send_json(resp.status, json.loads(resp.read()))
         except Exception as e:
             logging.error(f"GET {path}: {e}")
             self.send_json(502, {"error": str(e)})
