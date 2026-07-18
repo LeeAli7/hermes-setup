@@ -36,6 +36,8 @@ def anthropic_tools_to_openai(tools):
 
 def anthropic_messages_to_openai(messages):
     result = []
+    tool_name_by_id = {}
+
     for msg in messages or []:
         role = msg.get("role", "user")
         content_blocks = msg.get("content", [])
@@ -60,24 +62,22 @@ def anthropic_messages_to_openai(messages):
                 tool_results.append(block)
 
         if role == "assistant" and tool_uses:
-            text = "\n".join(text_parts) if text_parts else None
-            asst = {"role": "assistant", "content": text}
-            asst["tool_calls"] = [
-                {
-                    "id": tu["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tu["name"],
-                        "arguments": json.dumps(tu["input"]),
-                    },
-                }
-                for tu in tool_uses
-            ]
-            result.append(asst)
+            descs = []
+            for tu in tool_uses:
+                tool_name_by_id[tu["id"]] = tu["name"]
+                inp = json.dumps(tu["input"])
+                descs.append(f"[Calling {tu['name']}({inp})]")
+            if text_parts:
+                text_parts.append("")
+            text_parts.extend(descs)
+            text = "\n".join(text_parts)
+            result.append({"role": "assistant", "content": text})
             continue
 
         if tool_results:
+            texts = []
             for tr in tool_results:
+                tname = tool_name_by_id.get(tr["tool_use_id"], "tool")
                 tr_content = tr.get("content", "")
                 if isinstance(tr_content, list):
                     tr_text = "\n".join(
@@ -85,11 +85,8 @@ def anthropic_messages_to_openai(messages):
                     )
                 else:
                     tr_text = str(tr_content)
-                result.append({
-                    "role": "tool",
-                    "tool_call_id": tr["tool_use_id"],
-                    "content": tr_text,
-                })
+                texts.append(f"[Result from {tname}: {tr_text}]")
+            result.append({"role": "user", "content": "\n".join(texts)})
             continue
 
         text = "\n".join(text_parts) if text_parts else ""
