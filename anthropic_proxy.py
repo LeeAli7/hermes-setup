@@ -1,5 +1,6 @@
 import json, os, sys, logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 import urllib.request
 
@@ -264,9 +265,17 @@ class Proxy(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
+    def log_message(self, format, *args):
+        pass
+
+
+class ThreadingProxyServer(ThreadingMixIn, HTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
 
 if __name__ == "__main__":
-    server = HTTPServer((HOST, PORT), Proxy)
+    server = ThreadingProxyServer((HOST, PORT), Proxy)
     logging.info(f"Anthropic Proxy running on {HOST}:{PORT} → {UPSTREAM_BASE}")
     try:
         server.serve_forever()
