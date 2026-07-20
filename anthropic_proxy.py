@@ -34,9 +34,16 @@ def anthropic_tools_to_openai(tools):
     return result
 
 
+def extract_tool_content(tr_content):
+    if isinstance(tr_content, list):
+        return "\n".join(
+            b.get("text", "") for b in tr_content if b.get("type") == "text"
+        )
+    return str(tr_content)
+
+
 def anthropic_messages_to_openai(messages):
     result = []
-    tool_name_by_id = {}
 
     for msg in messages or []:
         role = msg.get("role", "user")
@@ -62,31 +69,31 @@ def anthropic_messages_to_openai(messages):
                 tool_results.append(block)
 
         if role == "assistant" and tool_uses:
-            descs = []
-            for tu in tool_uses:
-                tool_name_by_id[tu["id"]] = tu["name"]
-                inp = json.dumps(tu["input"])
-                descs.append(f"[Calling {tu['name']}({inp})]")
+            oa_msg = {"role": "assistant"}
             if text_parts:
-                text_parts.append("")
-            text_parts.extend(descs)
-            text = "\n".join(text_parts)
-            result.append({"role": "assistant", "content": text})
+                oa_msg["content"] = "\n".join(text_parts)
+            oa_msg["tool_calls"] = [
+                {
+                    "id": tu["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tu["name"],
+                        "arguments": json.dumps(tu["input"]),
+                    },
+                }
+                for tu in tool_uses
+            ]
+            result.append(oa_msg)
             continue
 
         if tool_results:
-            texts = []
             for tr in tool_results:
-                tname = tool_name_by_id.get(tr["tool_use_id"], "tool")
-                tr_content = tr.get("content", "")
-                if isinstance(tr_content, list):
-                    tr_text = "\n".join(
-                        b.get("text", "") for b in tr_content if b.get("type") == "text"
-                    )
-                else:
-                    tr_text = str(tr_content)
-                texts.append(f"[Result from {tname}: {tr_text}]")
-            result.append({"role": "user", "content": "\n".join(texts)})
+                tr_text = extract_tool_content(tr.get("content", ""))
+                result.append({
+                    "role": "tool",
+                    "tool_call_id": tr["tool_use_id"],
+                    "content": tr_text,
+                })
             continue
 
         text = "\n".join(text_parts) if text_parts else ""
@@ -137,6 +144,9 @@ class Proxy(BaseHTTPRequestHandler):
             self.send_json(400, {"error": oa_msgs[1]})
             return
 
+        if system:
+            oa_msgs.insert(0, {"role": "system", "content": system})
+
         oa_body = {
             "model": model,
             "messages": oa_msgs,
@@ -150,7 +160,22 @@ class Proxy(BaseHTTPRequestHandler):
         if tools:
             oa_body["tools"] = anthropic_tools_to_openai(tools)
         if tool_choice:
-            oa_body["tool_choice"] = tool_choice
+            tc = tool_choice
+            if isinstance(tc, dict):
+                tc_type = tc.get("type")
+                if tc_type == "auto":
+                    oa_body["tool_choice"] = "auto"
+                elif tc_type == "any":
+                    oa_body["tool_choice"] = "required"
+                elif tc_type == "tool":
+                    oa_body["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": tc.get("name")},
+                    }
+                else:
+                    oa_body["tool_choice"] = tc
+            else:
+                oa_body["tool_choice"] = tc
 
         status, data = self._upstream_post("/chat/completions", oa_body)
 
@@ -192,7 +217,7 @@ class Proxy(BaseHTTPRequestHandler):
 
             if reasoning:
                 content_blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
-            if content and not has_tool_calls:
+            if content:
                 content_blocks.append({"type": "text", "text": content})
 
             for tc in (msg.get("tool_calls") or []):
