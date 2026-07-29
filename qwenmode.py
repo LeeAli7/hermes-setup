@@ -645,6 +645,47 @@ def _format_chat_result(content_text: str, reasoning: str) -> dict:
 
 
 # ─── Pool ───────────────────────────────────────────────────────────────────
+# Cookie pool constants
+COOKIE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies")
+COOKIE_LIMIT = int(os.getenv("QWENMODE_COOKIE_LIMIT", "10"))
+
+
+def _load_cookies_from_file(filepath: str) -> list[dict]:
+    """Load and normalize cookies from a JSON file."""
+    import json
+    with open(filepath, "r") as f:
+        raw = json.load(f)
+
+    _PLAYWRIGHT_COOKIE_FIELDS = {
+        "name", "value", "domain", "path", "expires",
+        "httpOnly", "secure", "sameSite", "url"
+    }
+    cookies = []
+    for c in raw:
+        cc = {}
+        for k, v in c.items():
+            if k == "expirationDate":
+                cc["expires"] = int(v)
+            elif k in _PLAYWRIGHT_COOKIE_FIELDS:
+                cc[k] = v
+        if "sameSite" in cc:
+            ss = cc["sameSite"]
+            if ss is None:
+                del cc["sameSite"]
+            elif isinstance(ss, str):
+                ssl = ss.lower()
+                if ssl == "lax":
+                    cc["sameSite"] = "Lax"
+                elif ssl == "strict":
+                    cc["sameSite"] = "Strict"
+                elif ssl in ("none", "no_restriction"):
+                    cc["sameSite"] = "None"
+                else:
+                    del cc["sameSite"]
+        cookies.append(cc)
+    return cookies
+
+
 class QwenModePool:
     def __init__(self, size: int = POOL_SIZE, model: str = "Qwen3.8-Max-Preview", headless: bool = HEADLESS):
         self.size = size
@@ -657,6 +698,60 @@ class QwenModePool:
         self._available = asyncio.Semaphore(size)
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._shutdown = False
+        # Cookie rotation
+        self._cookie_pool: list[list[dict]] = []  # list of cookie sets
+        self._cookie_idx: int = 0
+        self._cookie_usage: int = 0
+
+    def _scan_cookies(self) -> None:
+        """Scan cookies/ directory for JSON files."""
+        self._cookie_pool = []
+        if not os.path.isdir(COOKIE_DIR):
+            # Also check legacy cookies.json in script dir
+            legacy = os.path.join(os.path.dirname(__file__), "cookies.json")
+            if os.path.exists(legacy):
+                try:
+                    self._cookie_pool.append(_load_cookies_from_file(legacy))
+                    log.info(f"Loaded legacy cookies.json as cookie set #0")
+                except Exception as e:
+                    log.warning(f"Failed to load legacy cookies.json: {e}")
+            return
+
+        files = sorted([f for f in os.listdir(COOKIE_DIR) if f.endswith(".json")])
+        for fname in files:
+            fpath = os.path.join(COOKIE_DIR, fname)
+            try:
+                cookies = _load_cookies_from_file(fpath)
+                if cookies:
+                    self._cookie_pool.append(cookies)
+                    log.info(f"Loaded {len(cookies)} cookies from {fname}")
+            except Exception as e:
+                log.warning(f"Failed to load {fname}: {e}")
+
+    async def _apply_cookies(self) -> None:
+        """Apply current cookie set to browser context. Rotates on limit."""
+        if not self._cookie_pool:
+            return
+        if self._cookie_idx >= len(self._cookie_pool):
+            self._cookie_idx = 0  # Wrap around
+        cookies = self._cookie_pool[self._cookie_idx]
+        try:
+            await self.ctx.clear_cookies()
+            await self.ctx.add_cookies(cookies)
+            log.info(f"Applied cookie set #{self._cookie_idx} ({len(cookies)} cookies, use {self._cookie_usage}/{COOKIE_LIMIT})")
+        except Exception as e:
+            log.warning(f"Failed to apply cookies #{self._cookie_idx}: {e}")
+
+    def _rotate_cookies(self) -> None:
+        """Switch to next cookie set (called on limit hit)."""
+        total = len(self._cookie_pool)
+        if total <= 1:
+            log.warning("Only 1 cookie set, cannot rotate")
+            return
+        old = self._cookie_idx
+        self._cookie_idx = (self._cookie_idx + 1) % total
+        self._cookie_usage = 0
+        log.info(f"Rotated cookies: #{old} -> #{self._cookie_idx} ({total} sets)")
 
     async def start(self) -> None:
         self.playwright = await async_playwright().start()
@@ -671,45 +766,10 @@ class QwenModePool:
             timezone_id="Europe/Helsinki",
         )
 
-        # Load cookies if they exist (skip in guest mode)
-        if not GUEST_MODE and os.path.exists("cookies.json"):
-            try:
-                import json
-                with open("cookies.json", "r") as f:
-                    raw = json.load(f)
-                # Filter to only accepted Playwright fields
-                _PLAYWRIGHT_COOKIE_FIELDS = {
-                    "name", "value", "domain", "path", "expires",
-                    "httpOnly", "secure", "sameSite", "url"
-                }
-                cookies = []
-                for c in raw:
-                    cc = {}
-                    for k, v in c.items():
-                        if k == "expirationDate":
-                            cc["expires"] = int(v)
-                        elif k in _PLAYWRIGHT_COOKIE_FIELDS:
-                            cc[k] = v
-                    # Normalize sameSite
-                    if "sameSite" in cc:
-                        ss = cc["sameSite"]
-                        if ss is None:
-                            del cc["sameSite"]
-                        elif isinstance(ss, str):
-                            ssl = ss.lower()
-                            if ssl == "lax":
-                                cc["sameSite"] = "Lax"
-                            elif ssl == "strict":
-                                cc["sameSite"] = "Strict"
-                            elif ssl in ("none", "no_restriction"):
-                                cc["sameSite"] = "None"
-                            else:
-                                del cc["sameSite"]
-                    cookies.append(cc)
-                await self.ctx.add_cookies(cookies)
-                print(f"[QwenMode] Loaded {len(cookies)} cookies from cookies.json")
-            except Exception as e:
-                print(f"[QwenMode] Failed to load cookies: {e}")
+        # Load cookie pool (skip in guest mode)
+        if not GUEST_MODE:
+            self._scan_cookies()
+            await self._apply_cookies()
 
         await self.ctx.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -762,6 +822,25 @@ class QwenModePool:
             page = await _create_page(self.ctx, self.model)
             self._states[idx] = PageState(page=page)
             log.info(f"Page {idx} recreated")
+        except Exception as e:
+            log.error(f"Page {idx} recreate failed: {e}")
+            self._states[idx] = None
+
+    async def _recreate_page_with_cookies(self, idx: int) -> None:
+        """Recreate a page, clearing and re-applying current cookie set."""
+        old = self._states[idx]
+        if old:
+            try:
+                await old.page.close()
+            except Exception:
+                pass
+        try:
+            if not GUEST_MODE and self._cookie_pool:
+                await self.ctx.clear_cookies()
+                await self._apply_cookies()
+            page = await _create_page(self.ctx, self.model)
+            self._states[idx] = PageState(page=page)
+            log.info(f"Page {idx} recreated with cookie set #{self._cookie_idx}")
         except Exception as e:
             log.error(f"Page {idx} recreate failed: {e}")
             self._states[idx] = None
@@ -829,11 +908,20 @@ class QwenModePool:
                     )
                     text = res.get("text", "")
                     if text.startswith("[Qwen Error]"):
-                        # Limit errors won't go away with retry
+                        # Limit errors — rotate cookies and retry
                         if "limit" in text.lower() or "usage" in text.lower():
                             log.warning(f"Page {idx} hit rate limit: {text[:100]}")
-                            result = (res, new_page)
-                            break
+                            if not GUEST_MODE:
+                                self._rotate_cookies()
+                            # Recreate page with new cookies
+                            async with self._lock:
+                                await self._recreate_page_with_cookies(idx)
+                                new_state = self._states[idx]
+                                if new_state is None:
+                                    return {"text": "[QwenMode] Page unavailable after rotate", "reasoning": ""}
+                                new_state.busy = True
+                                state = new_state
+                            continue  # Retry with new page
                         if attempt == 0:
                             log.info(f"Page {idx} got Qwen error: {text[:200]}, refreshing and retry")
                             try:
@@ -855,6 +943,14 @@ class QwenModePool:
                 if result is None:
                     result = (res, new_page)  # Use last attempt anyway
                 result, new_page = result
+
+                # Increment cookie usage and rotate if limit reached
+                if not GUEST_MODE and self._cookie_pool:
+                    self._cookie_usage += 1
+                    if self._cookie_usage >= COOKIE_LIMIT:
+                        log.info(f"Cookie set #{self._cookie_idx} reached limit ({self._cookie_usage}/{COOKIE_LIMIT}), rotating")
+                        self._rotate_cookies()
+
                 async with self._lock:
                     if new_page != state.page:
                         try:
