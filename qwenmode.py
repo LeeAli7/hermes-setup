@@ -308,6 +308,13 @@ def _parse_qwen_sse(raw: str) -> dict:
                 reasoning_parts.append(str(thought_content[0]))
         elif phase == "answer" and content:
             answer_parts.append(str(content))
+        elif phase == "tool_call" or phase == "tool":
+            # Tool call phases — capture as content for parsing
+            if content:
+                answer_parts.append(str(content))
+        elif content:
+            # Any other phase with content — accept it
+            answer_parts.append(str(content))
         elif delta.get("status") == "finished":
             break
 
@@ -464,8 +471,8 @@ def _build_prompt(messages: list[dict]) -> str:
 
         if role == "system":
             text = str(content) if content else ""
-            if len(text) > 800:
-                text = text[:800] + "\n...[system truncated]"
+            if len(text) > 2000:
+                text = text[:2000] + "\n...[system truncated]"
             parts.append(f"[System]\n{text}")
 
         elif role == "user":
@@ -475,8 +482,8 @@ def _build_prompt(messages: list[dict]) -> str:
                 text = "\n".join(texts)
             else:
                 text = str(content)
-            if len(text) > 2000:
-                text = text[:2000] + "\n...[user message truncated]"
+            if len(text) > 4000:
+                text = text[:4000] + "\n...[user message truncated]"
             parts.append(text)
 
         elif role == "assistant":
@@ -488,39 +495,66 @@ def _build_prompt(messages: list[dict]) -> str:
             elif isinstance(content, list):
                 texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
                 text = "\n".join(texts)
-                if len(text) > 500:
-                    text = text[:500] + "\n...[truncated]"
+                if len(text) > 2000:
+                    text = text[:2000] + "\n...[truncated]"
                 parts.append(text)
             else:
                 text = str(content)
-                if len(text) > 500:
-                    text = text[:500] + "\n...[truncated]"
+                if len(text) > 2000:
+                    text = text[:2000] + "\n...[truncated]"
                 parts.append(text)
 
         elif role == "tool":
             text = str(content)
-            if len(text) > 300:
-                text = text[:300] + "\n...[tool result truncated]"
+            if len(text) > 2000:
+                text = text[:2000] + "\n...[tool result truncated]"
             parts.append(f"[Tool result]\n{text}")
 
     return "\n\n".join(parts).strip()
 
 
 def _build_tool_prompt(last_content: str, tools: list[dict]) -> str:
-    """Append tool descriptions to prompt."""
-    desc_lines = ["Available tools:"]
+    """Append full tool descriptions (including JSON schema) to prompt."""
+    desc_lines = ["# Available tools"]
     for t in tools:
         fn = t.get("function", {})
         name = fn.get("name", "")
         desc = fn.get("description", "")
-        short = desc.split("\n")[0] if desc else ""
-        if len(short) > 120:
-            short = short[:120] + "..."
-        desc_lines.append(f" {name}: {short}")
+        params = fn.get("parameters", {})
+        props = params.get("properties", {})
+        required = params.get("required", [])
+        # Tool header
+        desc_lines.append(f"\n## {name}")
+        if desc:
+            short = desc.split("\n")[0] if desc else ""
+            if len(short) > 300:
+                short = short[:300] + "..."
+            desc_lines.append(f"  {short}")
+        # Arguments schema
+        if props:
+            desc_lines.append("  Arguments:")
+            for pname, pinfo in props.items():
+                ptype = pinfo.get("type", "string")
+                pdesc = pinfo.get("description", "")
+                preq = " (required)" if pname in required else ""
+                pshort = pdesc.split("\n")[0][:120] if pdesc else ""
+                desc_lines.append(f"    {pname}: {ptype}{preq}")
+                if pshort:
+                    desc_lines.append(f"      {pshort}")
+
     desc_lines.extend([
         "",
-        'Respond with ONLY: {"tool": "name", "arguments": {...}}',
-        "NO other text. NO explanation.",
+        "# Output Format",
+        "You may respond with ONE tool call OR a normal text answer.",
+        "",
+        "For a tool call, output EXACTLY:",
+        '{"tool": "tool_name", "arguments": {"arg1": "value1", "arg2": "value2"}}',
+        "",
+        "If you need to call MULTIPLE tools at once, output them on separate lines:",
+        '{"tool": "tool1", "arguments": {...}}',
+        '{"tool": "tool2", "arguments": {...}}',
+        "",
+        "NO additional text, NO markdown, NO explanation around tool calls.",
         "",
         last_content,
     ])
@@ -528,8 +562,11 @@ def _build_tool_prompt(last_content: str, tools: list[dict]) -> str:
 
 
 # ─── Tool Call Parsing ──────────────────────────────────────────────────────
-def _extract_json(text: str) -> tuple[Optional[str], Optional[dict]]:
-    """Extract tool call JSON from text."""
+def _extract_all_tool_calls(text: str) -> list[tuple[str, dict]]:
+    """Extract ALL tool call JSON objects from text."""
+    results: list[tuple[str, dict]] = []
+
+    # 1. Find all JSON blocks with "tool" or "function" keys
     idx = 0
     while True:
         tool_pos = text.find('"tool"', idx)
@@ -553,75 +590,105 @@ def _extract_json(text: str) -> tuple[Optional[str], Optional[dict]]:
                 try:
                     obj = json.loads(chunk)
                     if isinstance(obj, dict):
-                        name = obj.get("tool") or obj.get("function")
+                        name = obj.get("tool") or obj.get("function", {}).get("name") or obj.get("function")
                         if name:
-                            return name, obj.get("arguments", {})
+                            args = obj.get("arguments", {})
+                            results.append((str(name), args))
                 except Exception:
                     pass
                 break
             i += 1
 
-    # Try code block
-    m = re.search(r'`{3}(?:json)?\s*(\{.*\}|\[.*\])\s*`{3}', text, re.DOTALL)
-    if m:
-        try:
-            obj = json.loads(m.group(1))
-            if isinstance(obj, dict):
-                name = obj.get("tool") or obj.get("function")
-                if name:
-                    return name, obj.get("arguments", {})
-        except Exception:
-            pass
-    return None, None
+    # 2. If nothing found, try code blocks
+    if not results:
+        for m in re.finditer(r'`{3}(?:json)?\s*(\{.*?\}|\[.*?\])\s*`{3}', text, re.DOTALL):
+            try:
+                obj = json.loads(m.group(1))
+                if isinstance(obj, dict):
+                    name = obj.get("tool") or obj.get("function", {}).get("name") or obj.get("function")
+                    if name:
+                        args = obj.get("arguments", {})
+                        results.append((str(name), args))
+                elif isinstance(obj, list):
+                    for item in obj:
+                        if isinstance(item, dict):
+                            name = item.get("tool") or item.get("function", {}).get("name") or item.get("function")
+                            if name:
+                                args = item.get("arguments", {})
+                                results.append((str(name), args))
+            except Exception:
+                pass
+
+    return results
 
 
-def _parse_tool_call(text: str) -> tuple[Optional[str], Optional[dict]]:
-    """Parse tool call from model response."""
-    name, args = _extract_json(text)
-    if name and args:
-        param_map = {
-            "file_path": "filePath", "filepath": "filePath", "path": "filePath",
-            "old_str": "oldString", "oldstring": "oldString", "old": "oldString",
-            "old_text": "oldString", "oldText": "oldString",
-            "new_str": "newString", "newstring": "newString", "new": "newString",
-            "new_text": "newString", "newText": "newString",
-        }
-        norm = {}
-        for k, v in args.items():
-            norm[param_map.get(k, k)] = v
+def _normalize_args(name: str, args: dict) -> dict:
+    """Normalize argument keys to opencode expectations."""
+    param_map = {
+        "file_path": "filePath", "filepath": "filePath", "path": "filePath",
+        "old_str": "oldString", "oldstring": "oldString", "old": "oldString",
+        "old_text": "oldString", "oldText": "oldString",
+        "new_str": "newString", "newstring": "newString", "new": "newString",
+        "new_text": "newString", "newText": "newString",
+        "content": "content", "filePath": "filePath", "command": "command",
+        "file": "filePath", "source": "filePath", "target": "filePath",
+        "destination": "filePath", "dest": "filePath",
+        "before": "oldString", "after": "newString",
+        "code": "content", "text": "content", "data": "content",
+    }
+    norm = {}
+    for k, v in args.items():
+        norm[param_map.get(k, k)] = v
 
-        if name == "edit" and "edits" in norm and isinstance(norm["edits"], list) and len(norm["edits"]) > 0:
-            ed = norm["edits"][0]
-            if isinstance(ed, dict):
-                if "oldString" not in norm:
-                    norm["oldString"] = ed.get("oldText") or ed.get("old") or ed.get("old_str") or ""
-                if "newString" not in norm:
-                    norm["newString"] = ed.get("newText") or ed.get("new") or ed.get("new_str") or ""
-                del norm["edits"]
-        return name, norm
+    if name == "edit" and "edits" in norm and isinstance(norm["edits"], list) and len(norm["edits"]) > 0:
+        ed = norm["edits"][0]
+        if isinstance(ed, dict):
+            if "oldString" not in norm:
+                norm["oldString"] = ed.get("oldText") or ed.get("old") or ed.get("old_str") or ""
+            if "newString" not in norm:
+                norm["newString"] = ed.get("newText") or ed.get("new") or ed.get("new_str") or ""
+            del norm["edits"]
+    return norm
 
-    # Natural language edit: "C:\path\file: change 'old' to 'new'"
-    m = re.search(r'''([A-Z]:\\.+?):\s*(?:change|replace)\s+(?:the\s+)?(?:text\s+)?['"]?(.+?)['"]?\s+(?:to|with)\s+['"]?(.+?)['"]?''', text, re.IGNORECASE)
-    if m:
-        return "edit", {"filePath": m.group(1).strip(), "oldString": m.group(2), "newString": m.group(3)}
 
-    return None, None
+def _remove_explanation_prefix(text: str) -> str:
+    """Strip thinking/explanation text before the first JSON tool call block."""
+    # If text starts with analysis, then has a JSON block later
+    lines = text.strip().split("\n")
+    clean_lines = []
+    found_json = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("{") and ('"tool"' in stripped or '"function"' in stripped):
+            found_json = True
+            clean_lines.append(stripped)
+        elif found_json:
+            clean_lines.append(stripped)
+        elif not found_json and (stripped.startswith("{") or stripped == ""):
+            pass  # skip non-JSON before first tool call
+    if clean_lines:
+        return "\n".join(clean_lines)
+    return text
 
 
 def _format_chat_result(content_text: str, reasoning: str) -> dict:
-    """Format result into OpenAI-compatible response."""
-    tool_name, tool_args = _parse_tool_call(content_text)
+    """Format result into OpenAI-compatible response, supporting multiple tool calls."""
+    tool_calls_raw = _extract_all_tool_calls(content_text)
 
-    if tool_name:
-        tc_id = f"call_{uuid.uuid4().hex[:8]}"
+    if tool_calls_raw:
+        tc_list = []
+        for name, raw_args in tool_calls_raw:
+            norm_args = _normalize_args(name, raw_args)
+            tc_id = f"call_{uuid.uuid4().hex[:8]}"
+            tc_list.append({
+                "id": tc_id,
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(norm_args)},
+            })
         return {
             "role": "assistant",
             "content": None,
-            "tool_calls": [{
-                "id": tc_id,
-                "type": "function",
-                "function": {"name": tool_name, "arguments": json.dumps(tool_args)},
-            }],
+            "tool_calls": tc_list,
         }
 
     # File path pattern: "C:\file.txt" or "/home/user/file"
@@ -954,7 +1021,7 @@ class QwenModePool:
 
                 if new_page == state.page:
                     # Reset page after inactivity, keep for multi-turn bursts
-                    RESET_IDLE = 30.0
+                    RESET_IDLE = 120.0
                     try:
                         cur_url = state.page.url
                         idle = time.time() - state.last_used
@@ -1107,6 +1174,31 @@ def run_server(port: int = 5002) -> None:
             }
 
         async def gen():
+            has_tc = bool(result.get("tool_calls"))
+            content = result.get("content", "")
+            reasoning = result.get("reasoning_content", "")
+            tc = result.get("tool_calls")
+
+            # If tool calls: stream the entire tool call as first chunk, then finish
+            if has_tc and tc:
+                tc_deltas = []
+                for i, t in enumerate(tc):
+                    tc_deltas.append({
+                        "index": i,
+                        "id": t["id"],
+                        "type": "function",
+                        "function": {
+                            "name": t["function"]["name"],
+                            "arguments": t["function"]["arguments"],
+                        },
+                    })
+                if reasoning:
+                    yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": req.model, "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": reasoning}, "finish_reason": None}]})}\n\n'
+                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": req.model, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tc_deltas}, "finish_reason": None}]})}\n\n'
+                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": req.model, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})}\n\n'
+                yield "data: [DONE]\n\n"
+                return
+
             if reasoning:
                 yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": req.model, "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": reasoning}, "finish_reason": None}]})}\n\n'
 
@@ -1117,10 +1209,6 @@ def run_server(port: int = 5002) -> None:
                     chunk = " ".join(words[i:i+5])
                     yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": req.model, "choices": [{"index": 0, "delta": {"content": chunk + " "}, "finish_reason": None}]})}\n\n'
                     await asyncio.sleep(0.01)
-
-            if has_tc:
-                tc = result["tool_calls"][0]
-                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": req.model, "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}]}, "finish_reason": None}]})}\n\n'
 
             yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": req.model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})}\n\n'
             yield "data: [DONE]\n\n"
