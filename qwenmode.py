@@ -370,13 +370,18 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) 
     """Send prompt and wait for response via SSE or DOM fallback."""
     bodies: dict[str, Optional[str]] = {"raw": None}
     response_event = asyncio.Event()
+    capture_ts = [0.0]  # track latest capture timestamp
 
     async def capture(resp) -> None:
         if _SSE_URL_PATTERN in resp.url and bodies["raw"] is None:
             try:
                 raw = await asyncio.wait_for(resp.text(), timeout=timeout)
-                bodies["raw"] = raw
-                response_event.set()
+                now = time.time()
+                # Only accept if this is the latest response (stale check)
+                if now > capture_ts[0]:
+                    capture_ts[0] = now
+                    bodies["raw"] = raw
+                    response_event.set()
             except Exception:
                 pass
 
@@ -388,14 +393,23 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) 
         await _type_text(page, prompt)
         await asyncio.sleep(0.5)
 
+        # Verify textarea has the text before sending
+        try:
+            ta_val = await page.evaluate("() => document.querySelector('textarea')?.value || ''")
+            if len(ta_val.strip()) < len(prompt.strip()):
+                await _type_text(page, prompt)
+                await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
         # Send loop — press Enter, dismiss login modal if it appears, retry
         for send_attempt in range(3):
             response_event.clear()
             await _click_send(page)
 
-            # Wait short for SSE (high chance it comes in 3-5s if no modal)
+            # Wait for SSE — Qwen3.8 has thinking phase that takes 5-10s
             try:
-                await asyncio.wait_for(response_event.wait(), timeout=3.0)
+                await asyncio.wait_for(response_event.wait(), timeout=10.0)
                 break  # Got SSE!
             except asyncio.TimeoutError:
                 pass
@@ -508,7 +522,19 @@ def _build_prompt(messages: list[dict]) -> str:
             text = str(content)
             if len(text) > 2000:
                 text = text[:2000] + "\n...[tool result truncated]"
-            parts.append(f"[Tool result]\n{text}")
+            # Include tool name from the preceding assistant message
+            tool_name = m.get("name", "") or m.get("tool_name", "")
+            if not tool_name and parts:
+                # Scan back for last tool call from assistant
+                for p in reversed(parts):
+                    if '{"tool":' in p:
+                        import re as _re
+                        mm = _re.search(r'\{"tool": "([^"]+)"', p)
+                        if mm:
+                            tool_name = mm.group(1)
+                        break
+            prefix = f"[Tool result for {tool_name}]" if tool_name else "[Tool result]"
+            parts.append(f"{prefix}\n{text}")
 
     return "\n\n".join(parts).strip()
 
@@ -1157,7 +1183,7 @@ def run_server(port: int = 5002) -> None:
         content = result.get("content", "")
         reasoning = result.get("reasoning_content", "")
         has_tc = bool(result.get("tool_calls"))
-        finish = "tool_calls" if has_tc else "stop"
+        finish = "tool_calls" if has_tc else ("stop" if content else "stop")
 
         if not req.stream:
             msg = {"role": "assistant", "content": content}
