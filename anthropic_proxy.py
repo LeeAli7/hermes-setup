@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import json, os, sys, logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -10,6 +11,11 @@ PORT = int(os.environ.get("PROXY_PORT", "5000"))
 HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+_log_file = os.environ.get("PROXY_LOG_FILE", "")
+if _log_file:
+    fh = logging.FileHandler(_log_file, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(fh)
 
 
 def upstream_headers():
@@ -122,6 +128,7 @@ class Proxy(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         body = self.read_body()
+        logging.info(f"POST {parsed.path} model={body.get('model','?')} tools={bool(body.get('tools'))} msgs={len(body.get('messages',[]))}")
 
         if parsed.path in ("/v1/messages", "/v1/complete"):
             self.handle_anthropic(body)
@@ -191,6 +198,9 @@ class Proxy(BaseHTTPRequestHandler):
 
         choices = data.get("choices", [])
         usage = data.get("usage", {})
+
+        content_preview = str(data)[:200]
+        logging.info(f"Upstream OK choices={len(choices)} preview={content_preview}")
 
         resp = {
             "id": data.get("id", ""),
@@ -269,7 +279,7 @@ class Proxy(BaseHTTPRequestHandler):
             req = urllib.request.Request(
                 url, data=data, headers=upstream_headers(), method="POST",
             )
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=300) as resp:
                 return resp.status, json.loads(resp.read())
         except urllib.error.HTTPError as e:
             try:
@@ -308,7 +318,7 @@ class ThreadingProxyServer(ThreadingMixIn, HTTPServer):
 
 if __name__ == "__main__":
     server = ThreadingProxyServer((HOST, PORT), Proxy)
-    logging.info(f"Anthropic Proxy running on {HOST}:{PORT} → {UPSTREAM_BASE}")
+    logging.info(f"Anthropic Proxy running on {HOST}:{PORT} -> {UPSTREAM_BASE}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

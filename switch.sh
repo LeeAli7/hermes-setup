@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-HERMES="$HOME/hermes-agent/venv/bin/hermes"
+HERMES="$HOME/projects/hermes-agent/venv/bin/hermes"
 
 opencode_models="deepseek-v4-flash-free north-mini-code-free nemotron-3-ultra-free mimo-v2.5-free"
 kilo_models="poolside/laguna-m.1:free poolside/laguna-xs.2:free stepfun/step-3.7-flash:free cohere/north-mini-code:free nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free nvidia/nemotron-3-super-120b-a12b:free nvidia/nemotron-3-ultra-550b-a55b:free nvidia/nemotron-3.5-content-safety:free poolside/laguna-xs-2.1:free"

@@ -4,8 +4,8 @@
 
 set -e
 
-HERMES_DIR="$HOME/hermes"
-PYTHON="$HOME/hermes-agent/venv/bin/python3"
+HERMES_DIR="$HOME/projects/hermes"
+PYTHON="$HOME/projects/hermes-agent/venv/bin/python3"
 MANAGER="$HERMES_DIR/proxy_manager.py"
 PIDFILE="$HERMES_DIR/proxy_manager.pid"
 MANAGER_LOG="$HERMES_DIR/logs/proxy_manager.log"

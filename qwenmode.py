@@ -647,7 +647,6 @@ def _format_chat_result(content_text: str, reasoning: str) -> dict:
 # ─── Pool ───────────────────────────────────────────────────────────────────
 # Cookie pool constants
 COOKIE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies")
-COOKIE_LIMIT = int(os.getenv("QWENMODE_COOKIE_LIMIT", "10"))
 
 
 def _load_cookies_from_file(filepath: str) -> list[dict]:
@@ -701,7 +700,6 @@ class QwenModePool:
         # Cookie rotation
         self._cookie_pool: list[list[dict]] = []  # list of cookie sets
         self._cookie_idx: int = 0
-        self._cookie_usage: int = 0
 
     def _scan_cookies(self) -> None:
         """Scan cookies/ directory for JSON files."""
@@ -738,7 +736,7 @@ class QwenModePool:
         try:
             await self.ctx.clear_cookies()
             await self.ctx.add_cookies(cookies)
-            log.info(f"Applied cookie set #{self._cookie_idx} ({len(cookies)} cookies, use {self._cookie_usage}/{COOKIE_LIMIT})")
+            log.info(f"Applied cookie set #{self._cookie_idx} ({len(cookies)} cookies)")
         except Exception as e:
             log.warning(f"Failed to apply cookies #{self._cookie_idx}: {e}")
 
@@ -750,7 +748,6 @@ class QwenModePool:
             return
         old = self._cookie_idx
         self._cookie_idx = (self._cookie_idx + 1) % total
-        self._cookie_usage = 0
         log.info(f"Rotated cookies: #{old} -> #{self._cookie_idx} ({total} sets)")
 
     async def start(self) -> None:
@@ -943,13 +940,6 @@ class QwenModePool:
                 if result is None:
                     result = (res, new_page)  # Use last attempt anyway
                 result, new_page = result
-
-                # Increment cookie usage and rotate if limit reached
-                if not GUEST_MODE and self._cookie_pool:
-                    self._cookie_usage += 1
-                    if self._cookie_usage >= COOKIE_LIMIT:
-                        log.info(f"Cookie set #{self._cookie_idx} reached limit ({self._cookie_usage}/{COOKIE_LIMIT}), rotating")
-                        self._rotate_cookies()
 
                 async with self._lock:
                     if new_page != state.page:
