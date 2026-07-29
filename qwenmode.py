@@ -990,6 +990,26 @@ class QwenModePool:
                         return {"text": "[QwenMode] Page unavailable after recreate", "reasoning": ""}
                     state.busy = True
 
+            # Navigate to fresh chat if page has old conversation context
+            try:
+                cur_url = state.page.url
+                prev_conv = hasattr(self, '_last_conv_url') and getattr(self, '_last_conv_url')
+                # If we detect a previous conversation that's different from current, start fresh
+                if prev_conv and "/c/" in str(cur_url):
+                    # Navigate to root to start a new conversation
+                    await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(2)
+                    for _ in range(20):
+                        ta = await state.page.query_selector('textarea')
+                        if ta:
+                            break
+                        await asyncio.sleep(0.3)
+                    await _dismiss_auth_dialog(state.page)
+                    await _dismiss_modal(state.page)
+                self._last_conv_url = cur_url
+            except Exception:
+                pass
+
             try:
                 result = None
                 for attempt in range(2):
