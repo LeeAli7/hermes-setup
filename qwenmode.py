@@ -371,6 +371,16 @@ def _parse_qwen_sse(raw: str) -> dict:
         except Exception:
             continue
 
+        # Error events: {"error": {"code": "quota_limit", "details": "..."}}
+        if isinstance(ev, dict) and ev.get("error"):
+            err = ev["error"]
+            code = err.get("code", "unknown") if isinstance(err, dict) else "unknown"
+            details = err.get("details", "") if isinstance(err, dict) else str(err)
+            msg = f"[Qwen Error {code}]"
+            if details:
+                msg += f" {details}"
+            return {"text": msg, "reasoning": ""}
+
         choices = ev.get("choices", [])
         if not choices:
             continue
@@ -522,6 +532,8 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) 
 
         if bodies["raw"] is not None:
             parsed = _parse_qwen_sse(bodies["raw"])
+            if not parsed.get("text") and not parsed.get("reasoning"):
+                log.warning(f"SSE parsed EMPTY: {bodies['raw'][:800]!r}")
             # Dismiss post-response login prompt (guest mode)
             await _dismiss_auth_dialog(page)
             await _dismiss_modal(page)
@@ -564,9 +576,16 @@ def _build_prompt(messages: list[dict]) -> str:
 
         if role == "system":
             text = str(content) if content else ""
+            # Preserve the working directory even when truncating the rest —
+            # Qwen otherwise invents paths like /root or /home/user because
+            # it doesn't know the client's cwd.
+            wd_match = re.search(r"(?:Working directory|working directory|cwd)[:\s]+(\S+)", text)
+            wd_note = ""
+            if wd_match:
+                wd_note = f"\nWORKING DIRECTORY: {wd_match.group(1)} (create files here with relative paths)"
             if len(text) > 2000:
                 text = text[:2000] + "\n...[system truncated]"
-            parts.append(f"[System]\n{text}")
+            parts.append(f"[System]\n{text}{wd_note}")
 
         elif role == "user":
             if isinstance(content, list):
@@ -652,8 +671,15 @@ def _build_tool_prompt(last_content: str, tools: list[dict]) -> str:
         "# Output Format",
         "You may respond with ONE tool call OR a normal text answer.",
         "",
+        "IMPORTANT: Do NOT use any built-in Qwen tools, artifacts, code runner,",
+        "file browser, or Qwen Studio tool buttons. You have NO access to them.",
+        "Only the tools listed below exist. To call one, output the JSON format.",
+        "",
         "For a tool call, output EXACTLY:",
         '{"tool": "tool_name", "arguments": {"arg1": "value1", "arg2": "value2"}}',
+        "",
+        "Use EXACTLY the argument names listed in the Arguments section above.",
+        "Do NOT rename or substitute them (e.g. if the schema says \"path\", use \"path\", not \"filePath\").",
         "",
         "If you need to call MULTIPLE tools at once, output them on separate lines:",
         '{"tool": "tool1", "arguments": {...}}',
@@ -727,33 +753,92 @@ def _extract_all_tool_calls(text: str) -> list[tuple[str, dict]]:
     return results
 
 
-def _normalize_args(name: str, args: dict) -> dict:
-    """Normalize argument keys to opencode expectations."""
-    param_map = {
-        "file_path": "filePath", "filepath": "filePath", "path": "filePath",
-        "old_str": "oldString", "oldstring": "oldString", "old": "oldString",
-        "old_text": "oldString", "oldText": "oldString",
-        "new_str": "newString", "newstring": "newString", "new": "newString",
-        "new_text": "newString", "newText": "newString",
-        "content": "content", "filePath": "filePath", "command": "command",
-        "file": "filePath", "source": "filePath", "target": "filePath",
-        "destination": "filePath", "dest": "filePath",
-        "before": "oldString", "after": "newString",
-        "code": "content", "text": "content", "data": "content",
-    }
+def _normalize_args(name: str, args: dict, schema_params: Optional[set] = None) -> dict:
+    """Normalize argument keys to match the CLIENT's tool schema.
+
+    Qwen tends to rename arguments (e.g. 'path' -> 'filePath') based on
+    whatever style it saw in previous sessions. If we know the client's
+    schema (schema_params), map synonyms onto the exact names the client
+    expects. Without a schema, fall back to opencode conventions.
+    """
+    # Synonym groups — canonical first
+    groups = [
+        ["filePath", "path", "file_path", "filepath", "file", "source",
+         "target", "destination", "dest"],
+        ["oldString", "old_str", "oldstring", "old_text", "oldText", "old", "before"],
+        ["newString", "new_str", "newstring", "new_text", "newText", "new", "after"],
+        ["content", "code", "text", "data"],
+        ["command", "cmd", "shell"],
+    ]
+    schema_params = schema_params or set()
+
     norm = {}
     for k, v in args.items():
-        norm[param_map.get(k, k)] = v
+        if schema_params and k not in schema_params:
+            # Find a synonym that exists in the client's schema
+            mapped = False
+            for group in groups:
+                if k in group:
+                    for cand in group:
+                        if cand in schema_params:
+                            norm[cand] = v
+                            mapped = True
+                            break
+                    break
+            if not mapped:
+                norm[k] = v
+        else:
+            norm[k] = v
+
+    # Without a schema: legacy opencode mapping
+    if not schema_params:
+        legacy = {
+            "file_path": "filePath", "filepath": "filePath", "path": "filePath",
+            "old_str": "oldString", "oldstring": "oldString", "old": "oldString",
+            "old_text": "oldString", "oldText": "oldString",
+            "new_str": "newString", "newstring": "newString", "new": "newString",
+            "new_text": "newString", "newText": "newString",
+            "file": "filePath", "source": "filePath", "target": "filePath",
+            "destination": "filePath", "dest": "filePath",
+            "before": "oldString", "after": "newString",
+            "code": "content", "text": "content", "data": "content",
+        }
+        norm = {legacy.get(k, k): v for k, v in args.items()}
 
     if name == "edit" and "edits" in norm and isinstance(norm["edits"], list) and len(norm["edits"]) > 0:
         ed = norm["edits"][0]
         if isinstance(ed, dict):
-            if "oldString" not in norm:
+            if "oldString" not in norm and "old_str" not in norm and "old" not in norm:
                 norm["oldString"] = ed.get("oldText") or ed.get("old") or ed.get("old_str") or ""
-            if "newString" not in norm:
+            if "newString" not in norm and "new_str" not in norm and "new" not in norm:
                 norm["newString"] = ed.get("newText") or ed.get("new") or ed.get("new_str") or ""
             del norm["edits"]
+
+    # pi-style edit schema: {path, edits: [{oldText, newText}]}
+    # Qwen usually sends {path, oldString, newString} — convert.
+    if name == "edit" and schema_params and "edits" in schema_params:
+        old_k = next((k for k in ("oldString", "old_str", "oldText", "old_text", "old", "before") if k in norm), None)
+        new_k = next((k for k in ("newString", "new_str", "newText", "new_text", "new", "after") if k in norm), None)
+        if old_k is not None and new_k is not None and "edits" not in norm:
+            norm["edits"] = [{"oldText": norm.pop(old_k), "newText": norm.pop(new_k)}]
     return norm
+
+
+def _schema_params_for(tools: Optional[list]) -> dict:
+    """Build {tool_name: set(param_names)} from the client's tool schemas."""
+    if not tools:
+        return {}
+    smap = {}
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function", {})
+        name = fn.get("name", "")
+        if not name:
+            continue
+        props = fn.get("parameters", {}).get("properties", {})
+        smap[name] = set(props.keys()) if isinstance(props, dict) else set()
+    return smap
 
 
 def _remove_explanation_prefix(text: str) -> str:
@@ -776,14 +861,16 @@ def _remove_explanation_prefix(text: str) -> str:
     return text
 
 
-def _format_chat_result(content_text: str, reasoning: str) -> dict:
+def _format_chat_result(content_text: str, reasoning: str, tools: Optional[list] = None) -> dict:
     """Format result into OpenAI-compatible response, supporting multiple tool calls."""
     tool_calls_raw = _extract_all_tool_calls(content_text)
+    schema_map = _schema_params_for(tools)
 
     if tool_calls_raw:
         tc_list = []
         for name, raw_args in tool_calls_raw:
-            norm_args = _normalize_args(name, raw_args)
+            schema_params = schema_map.get(name)
+            norm_args = _normalize_args(name, raw_args, schema_params)
             tc_id = f"call_{uuid.uuid4().hex[:8]}"
             tc_list.append({
                 "id": tc_id,
@@ -1066,7 +1153,7 @@ class QwenModePool:
                     async with self._lock:
                         await self._recreate_page(i)
 
-    async def execute(self, prompt: str) -> dict:
+    async def execute(self, prompt: str, fresh: bool = False) -> dict:
         await self._available.acquire()
         try:
             async with self._lock:
@@ -1084,6 +1171,29 @@ class QwenModePool:
 
             state = self._states[idx]
 
+            # OpenAI API semantics: EVERY request lands in a CLEAN chat.
+            # Navigate to home so Qwen opens a brand-new conversation. If we're
+            # already on home (first request after start), skip the nav.
+            if fresh:
+                try:
+                    cur = state.page.url
+                    if "/c/" in str(cur):
+                        log.info(f"Page {idx}: fresh session — opening new chat")
+                        await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+                        # Wait only for textarea, nothing else (fast path)
+                        for _ in range(20):
+                            ta = await state.page.query_selector('textarea')
+                            if ta:
+                                break
+                            await asyncio.sleep(0.15)
+                        await _dismiss_auth_dialog(state.page)
+                        await _dismiss_modal(state.page)
+                        # Goto resets the model dropdown back to the default
+                        # (Qwen3.7-Plus) — re-select the configured model.
+                        await _select_model(state.page, self.model)
+                except Exception as e:
+                    log.warning(f"Page {idx} fresh-chat nav failed: {e}")
+
             # Double-check health outside lock
             if not await self._check_health(state.page):
                 async with self._lock:
@@ -1095,15 +1205,37 @@ class QwenModePool:
 
             try:
                 result = None
-                for attempt in range(2):
+                for attempt in range(4):
                     res, new_page = await _wait_for_response(
                         state.page, prompt, self.model, SSE_TIMEOUT
                     )
                     text = res.get("text", "")
+                    log.info(f"EXEC attempt={attempt} text_head={text[:120]!r}")
                     if text.startswith("[Qwen Error]"):
-                        # Limit errors — rotate cookies and retry
-                        if "limit" in text.lower() or "usage" in text.lower():
-                            log.warning(f"Page {idx} hit rate limit: {text[:100]}")
+                        # "high demand" / quota_limit = temporary per-minute rate
+                        # limit. Back off briefly and retry in the SAME session —
+                        # do NOT burn cookies (guest session trust is precious).
+                        if "high demand" in text.lower() or "quota" in text.lower() or "limit" in text.lower() or "usage" in text.lower():
+                            log.warning(f"Page {idx} hit rate limit: {text[:120]}")
+                            if "high demand" in text.lower() or "quota" in text.lower():
+                                # Temporary throttle — wait and retry same page
+                                backoff = 15 + attempt * 20
+                                log.info(f"Guest mode: throttled, backing off {backoff}s and retrying same page")
+                                await asyncio.sleep(backoff)
+                                # Fresh chat page keeps the session alive
+                                try:
+                                    await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+                                    await asyncio.sleep(2)
+                                    await _dismiss_auth_dialog(state.page)
+                                    await _dismiss_modal(state.page)
+                                    for _ in range(15):
+                                        ta = await state.page.query_selector('textarea')
+                                        if ta:
+                                            break
+                                        await asyncio.sleep(0.5)
+                                except Exception as e:
+                                    log.warning(f"Page {idx} refresh failed on throttle retry: {e}")
+                                continue  # Retry same page after backoff
                             if not GUEST_MODE:
                                 self._rotate_cookies()
                             else:
@@ -1200,7 +1332,15 @@ class QwenModePool:
 
     async def chat(self, messages: list[dict], tools: Optional[list] = None) -> dict:
         last_content = _build_prompt(messages)
-        log.info(f"CHAT: messages={len(messages)}, prompt_chars={len(last_content)}, tools={len(tools) if tools else 0}")
+        roles = [m.get('role') for m in messages]
+        # OpenAI API semantics: EVERY request is self-contained. The client
+        # (opencode/pi/Claude Code) sends the full history — system, user,
+        # assistant tool_calls AND tool results — inside messages on every
+        # call. So every request must land in a CLEAN chat: if we reuse the
+        # previous chat, the full prompt we type into the textarea is stacked
+        # on top of Qwen's own chat history -> duplicated context -> the model
+        # goes crazy and cross-contaminates sessions.
+        log.info(f"CHAT: messages={len(messages)}, prompt_chars={len(last_content)}, tools={len(tools) if tools else 0}, roles={roles}")
         if not last_content:
             return {"role": "assistant", "content": "[QwenMode] No message"}
 
@@ -1209,8 +1349,8 @@ class QwenModePool:
         else:
             prompt = last_content
 
-        result = await self.execute(prompt)
-        return _format_chat_result(result.get("text", ""), result.get("reasoning", ""))
+        result = await self.execute(prompt, fresh=True)
+        return _format_chat_result(result.get("text", ""), result.get("reasoning", ""), tools)
 
     async def close(self) -> None:
         self._shutdown = True
