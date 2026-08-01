@@ -96,6 +96,28 @@ async def _dismiss_modal(page: Page) -> bool:
     try:
         dismissed = await asyncio.wait_for(page.evaluate("""() => {
             const all = document.body?.innerText || '';
+            // 0. Guest mode: click "Stay logged out" / "Оставаться вышедшим" FIRST.
+            // This is THE button that lets the anonymous guest actually chat.
+            // Qwen shows a login modal on EVERY send for fresh guests; the
+            // only way past it is this button (X/close/backdrop clicks don't
+            // work — the modal just reappears).
+            {
+                const cands = [];
+                const allEls = document.querySelectorAll('*');
+                for (const el of allEls) {
+                    const t = (el.textContent || '').trim();
+                    if (t === 'Оставаться вышедшим' || t === 'Stay logged out') {
+                        cands.push(el);
+                    }
+                }
+                if (cands.length) {
+                    // Click the SMALLEST matching element (deepest node)
+                    cands.sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
+                    const el = cands[0];
+                    el.click();
+                    return true;
+                }
+            }
             // 1. Cookie consent banner
             const cookieBtns = document.querySelectorAll('button');
             for (const btn of cookieBtns) {
@@ -987,6 +1009,18 @@ class QwenModePool:
             try:
                 cookies = _load_cookies_from_file(fpath)
                 if cookies:
+                    if GUEST_MODE:
+                        # Guest mode: only anonymous guest cookie sets are usable.
+                        # Account cookies (containing a token) would log Qwen into
+                        # the real account, whose daily limits DO apply — that is
+                        # exactly the "upper limit for today's usage" trap.
+                        has_token = any(
+                            "token" in (c.get("name") or "").lower()
+                            for c in cookies
+                        )
+                        if has_token:
+                            log.info(f"Skipping {fname}: account cookies (token) not usable in guest mode")
+                            continue
                     self._cookie_pool.append(cookies)
                     log.info(f"Loaded {len(cookies)} cookies from {fname}")
             except Exception as e:
@@ -1034,10 +1068,13 @@ class QwenModePool:
             timezone_id="Europe/Helsinki",
         )
 
-        # Load cookie pool (skip in guest mode)
-        if not GUEST_MODE:
-            self._scan_cookies()
-            await self._apply_cookies()
+        # Load cookie pool. In guest mode only anonymous guest sets are loaded
+        # (account sets with a token are skipped by _scan_cookies). Applying the
+        # guest cookies re-establishes the "familiar" session — Qwen blocks
+        # FRESH guest sessions ("log in or sign up" modal / daily-limit errors)
+        # but accepts stable ones, exactly like a normal browser vs incognito.
+        self._scan_cookies()
+        await self._apply_cookies()
 
         await self.ctx.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -1246,13 +1283,13 @@ class QwenModePool:
                             if not GUEST_MODE:
                                 self._rotate_cookies()
                             else:
-                                # Guest mode: wipe cookies so the recreated page
-                                # gets a fresh guest session (old one is spent)
-                                try:
-                                    await self.ctx.clear_cookies()
-                                    log.info("Guest mode: cleared cookies on limit hit")
-                                except Exception as e:
-                                    log.warning(f"Guest mode: clear_cookies failed: {e}")
+                                # Guest mode: DO NOT clear cookies here. The
+                                # persistent profile IS the guest session's
+                                # trust — wiping it makes Qwen treat us as a
+                                # brand-new incognito visitor and it slams the
+                                # daily-limit / login-modal wall even harder.
+                                # Just recreate the page in the same session.
+                                log.info("Guest mode: keeping cookies, recreating page only")
                             # Recreate page with new cookies
                             async with self._lock:
                                 await self._recreate_page_with_cookies(idx)
@@ -1410,9 +1447,9 @@ def run_server(port: int = 5002) -> None:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         nonlocal pool
+        logging.basicConfig(level=logging.INFO)
         pool = QwenModePool(size=POOL_SIZE, model="Qwen3.8-Max-Preview")
         await pool.start()
-        logging.basicConfig(level=logging.INFO)
         yield
         await pool.close()
 
