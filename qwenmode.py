@@ -583,8 +583,8 @@ def _build_prompt(messages: list[dict]) -> str:
             wd_note = ""
             if wd_match:
                 wd_note = f"\nWORKING DIRECTORY: {wd_match.group(1)} (create files here with relative paths)"
-            if len(text) > 2000:
-                text = text[:2000] + "\n...[system truncated]"
+            if len(text) > 20000:
+                text = text[:20000] + "\n...[system truncated]"
             parts.append(f"[System]\n{text}{wd_note}")
 
         elif role == "user":
@@ -637,8 +637,8 @@ def _build_prompt(messages: list[dict]) -> str:
     return "\n\n".join(parts).strip()
 
 
-def _build_tool_prompt(last_content: str, tools: list[dict]) -> str:
-    """Append full tool descriptions (including JSON schema) to prompt."""
+def _build_tool_block(tools: list[dict]) -> str:
+    """Build ONLY the tool-description + JSON-output-format block (no user content)."""
     desc_lines = ["# Available tools"]
     for t in tools:
         fn = t.get("function", {})
@@ -671,8 +671,12 @@ def _build_tool_prompt(last_content: str, tools: list[dict]) -> str:
         "# Output Format",
         "You may respond with ONE tool call OR a normal text answer.",
         "",
-        "IMPORTANT: Do NOT use any built-in Qwen tools, artifacts, code runner,",
-        "file browser, or Qwen Studio tool buttons. You have NO access to them.",
+        "CRITICAL: You are connected through an API proxy. The ONLY way you can",
+        "interact with files or the shell is by outputting the JSON tool-call format",
+        "described below. You have NO built-in Qwen tools, artifacts, code runner,",
+        "file browser, or Qwen Studio tool buttons. Do NOT try to use them.",
+        "If you try to call a built-in tool you will only see an error like",
+        "'Tool X does not exists'. When you need a tool, output JSON instead.",
         "Only the tools listed below exist. To call one, output the JSON format.",
         "",
         "For a tool call, output EXACTLY:",
@@ -686,10 +690,13 @@ def _build_tool_prompt(last_content: str, tools: list[dict]) -> str:
         '{"tool": "tool2", "arguments": {...}}',
         "",
         "NO additional text, NO markdown, NO explanation around tool calls.",
-        "",
-        last_content,
     ])
     return "\n".join(desc_lines)
+
+
+def _build_tool_prompt(last_content: str, tools: list[dict]) -> str:
+    """Append full tool descriptions (including JSON schema) to prompt."""
+    return _build_tool_block(tools) + "\n\n" + last_content
 
 
 # ─── Tool Call Parsing ──────────────────────────────────────────────────────
@@ -1345,7 +1352,23 @@ class QwenModePool:
             return {"role": "assistant", "content": "[QwenMode] No message"}
 
         if tools:
-            prompt = _build_tool_prompt(last_content, tools)
+            # Order matters: context (system + history) FIRST, then our tool
+            # block, then the actual user request LAST. If the tool block is
+            # prepended, Qwen reads it, then a 10KB system prompt (opencode's
+            # own read/bash/edit/write descriptions) "retrains" it to use the
+            # built-in Qwen Studio tools -> "Tool read does not exists" errors.
+            # The instruction right before the request has the most weight.
+            user_idx = -1
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    user_idx = i
+                    break
+            if user_idx > 0:
+                ctx_text = _build_prompt(messages[:user_idx])
+                user_text = _build_prompt(messages[user_idx:])
+                prompt = f"{ctx_text}\n\n{_build_tool_block(tools)}\n\n{user_text}"
+            else:
+                prompt = _build_tool_prompt(last_content, tools)
         else:
             prompt = last_content
 
