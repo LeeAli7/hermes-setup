@@ -1068,13 +1068,15 @@ class QwenModePool:
             timezone_id="Europe/Helsinki",
         )
 
-        # Load cookie pool. In guest mode only anonymous guest sets are loaded
-        # (account sets with a token are skipped by _scan_cookies). Applying the
-        # guest cookies re-establishes the "familiar" session — Qwen blocks
-        # FRESH guest sessions ("log in or sign up" modal / daily-limit errors)
-        # but accepts stable ones, exactly like a normal browser vs incognito.
-        self._scan_cookies()
-        await self._apply_cookies()
+        # Load cookie pool. IMPORTANT: in guest mode do NOT apply cookie files
+        # from cookies/*.json — those are exports of an OLD session (possibly
+        # already daily-limited). The persistent profile itself accumulates
+        # fresh guest cookies naturally on each visit; applying stale exports
+        # re-binds us to the burned session and resurrects "upper limit for
+        # today's usage". Only the non-guest (account) mode uses cookie files.
+        if not GUEST_MODE:
+            self._scan_cookies()
+            await self._apply_cookies()
 
         await self.ctx.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
