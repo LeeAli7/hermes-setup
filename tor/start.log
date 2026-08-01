@@ -1,0 +1,7 @@
+Jul 24 20:23:24.022 [notice] Tor 0.4.9.8 running on Linux with Libevent 2.1.12-stable, OpenSSL 3.5.6, Zlib 1.3.1, Liblzma 5.8.1, Libzstd 1.5.7 and Glibc 2.41 as libc.
+Jul 24 20:23:24.022 [notice] Tor can't help you if you use it wrong! Learn how to be safe at https://support.torproject.org/faq/staying-anonymous/
+Jul 24 20:23:24.023 [notice] Read configuration file "/home/ali/projects/hermes/tor/torrc".
+Jul 24 20:23:24.033 [notice] Opening Socks listener on 127.0.0.1:9050
+Jul 24 20:23:24.033 [notice] Opened Socks listener connection (ready) on 127.0.0.1:9050
+Jul 24 20:23:24.033 [notice] Opening Control listener on 127.0.0.1:9051
+Jul 24 20:23:24.033 [notice] Opened Control listener connection (ready) on 127.0.0.1:9051

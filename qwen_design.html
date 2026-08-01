@@ -1,0 +1,934 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Марк Волков — дизайнер и арт-директор | Портфолио</title>
+<meta name="description" content="Портфолио графического дизайнера и арт-директора: айдентика, интерфейсы, сайты, моушн.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700;900&family=Golos+Text:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+/* ============ БАЗА ============ */
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --paper:#EDEAE1;
+  --ink:#161310;
+  --orange:#FF4A1C;
+  --cobalt:#2743F0;
+  --green:#1F7A4D;
+  --yellow:#FFC700;
+  --ease:cubic-bezier(.22,1,.36,1);
+  --pad:clamp(20px,5vw,80px);
+}
+html{scroll-behavior:smooth;scroll-padding-top:96px}
+body{
+  background:var(--paper);color:var(--ink);
+  font-family:'Golos Text',sans-serif;font-size:17px;line-height:1.6;
+  overflow-x:hidden;
+}
+body.locked{overflow:hidden}
+::selection{background:var(--orange);color:var(--paper)}
+::-webkit-scrollbar{width:12px}
+::-webkit-scrollbar-track{background:var(--paper)}
+::-webkit-scrollbar-thumb{background:var(--ink);border:3px solid var(--paper)}
+a{color:inherit;text-decoration:none}
+img,svg{display:block;max-width:100%}
+:focus-visible{outline:2px dashed var(--orange);outline-offset:4px}
+h1,h2,h3{font-family:'Unbounded',sans-serif;font-weight:900;line-height:1.02}
+.mono{font-family:'JetBrains Mono',monospace}
+
+/* зерно плёнки поверх всего */
+.grain{
+  position:fixed;inset:-60%;width:220%;height:220%;z-index:9999;pointer-events:none;opacity:.055;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  animation:grain 7s steps(8) infinite;
+}
+@keyframes grain{
+  0%,100%{transform:translate(0,0)}12%{transform:translate(-2%,1%)}25%{transform:translate(1%,-2%)}
+  37%{transform:translate(-1%,2%)}50%{transform:translate(2%,1%)}62%{transform:translate(-2%,-1%)}
+  75%{transform:translate(1%,2%)}87%{transform:translate(2%,-2%)}
+}
+
+/* ============ КУРСОР ============ */
+.cursor-dot,.cursor-ring{position:fixed;top:0;left:0;pointer-events:none;z-index:10002;border-radius:50%}
+.cursor-dot{width:8px;height:8px;background:var(--orange);transform:translate(-50%,-50%)}
+.cursor-ring{
+  width:38px;height:38px;border:2px solid var(--ink);transform:translate(-50%,-50%);
+  transition:width .3s var(--ease),height .3s var(--ease),border-color .3s,background .3s;
+}
+.cursor-ring.hot{width:64px;height:64px;border-color:var(--orange);background:rgba(255,74,28,.12)}
+@media (pointer:coarse){.cursor-dot,.cursor-ring{display:none}}
+@media (pointer:fine){body.cursor-on,body.cursor-on a,body.cursor-on button{cursor:none}}
+
+/* ============ ПРОГРЕСС + НАВЕРХ ============ */
+#progress{position:fixed;top:0;left:0;height:3px;width:0;background:var(--orange);z-index:1200}
+#toTop{
+  position:fixed;right:22px;bottom:22px;width:52px;height:52px;z-index:900;
+  border:2px solid var(--ink);background:var(--paper);font-family:'Unbounded';font-size:18px;
+  display:grid;place-items:center;opacity:0;transform:translateY(20px);pointer-events:none;
+  transition:opacity .4s,transform .4s,background .3s,color .3s;
+}
+#toTop.show{opacity:1;transform:none;pointer-events:auto}
+#toTop:hover{background:var(--ink);color:var(--paper)}
+
+/* ============ ПРЕЛОАДЕР ============ */
+.preloader{
+  position:fixed;inset:0;background:var(--ink);color:var(--paper);z-index:10000;
+  display:flex;flex-direction:column;justify-content:space-between;padding:4vh 4vw;
+  transition:transform .9s cubic-bezier(.76,0,.24,1) .15s,visibility 0s 1.2s;
+}
+.preloader.done{transform:translateY(-101%);visibility:hidden}
+.pre-top{display:flex;justify-content:space-between;font-family:'JetBrains Mono';font-size:12px;letter-spacing:.14em;text-transform:uppercase}
+.pre-top b{color:var(--orange)}
+.pre-count{align-self:flex-end;font-family:'Unbounded';font-weight:900;font-size:clamp(90px,22vw,280px);line-height:.85}
+.pre-bar{position:absolute;left:0;bottom:0;height:4px;background:var(--orange);width:0}
+
+/* ============ НАВИГАЦИЯ ============ */
+.nav{
+  position:fixed;top:0;left:0;right:0;z-index:1100;
+  display:flex;align-items:center;justify-content:space-between;
+  padding:18px var(--pad);transition:background .4s,border-color .4s,padding .4s;
+  border-bottom:2px solid transparent;
+}
+.nav.scrolled{background:var(--paper);border-color:var(--ink);padding-block:12px}
+.logo{font-family:'Unbounded';font-weight:900;font-size:20px;letter-spacing:.02em}
+.logo em{font-style:normal;color:var(--orange);display:inline-block;transition:transform .6s var(--ease)}
+.logo:hover em{transform:rotate(180deg)}
+.nav-links{display:flex;gap:clamp(16px,2.5vw,36px);list-style:none}
+.nav-links a{
+  font-family:'JetBrains Mono';font-size:13px;text-transform:uppercase;letter-spacing:.1em;
+  position:relative;padding:4px 0;
+}
+.nav-links a::after{content:'';position:absolute;left:0;bottom:0;height:2px;width:100%;background:var(--orange);transform:scaleX(0);transform-origin:right;transition:transform .35s var(--ease)}
+.nav-links a:hover::after{transform:scaleX(1);transform-origin:left}
+.nav-cta{
+  font-family:'JetBrains Mono';font-size:13px;text-transform:uppercase;letter-spacing:.08em;
+  border:2px solid var(--ink);padding:10px 18px;background:var(--ink);color:var(--paper);
+  transition:background .3s,color .3s,border-color .3s;
+}
+.nav-cta:hover{background:var(--orange);border-color:var(--orange)}
+.burger{display:none;background:none;border:0;width:40px;height:40px;position:relative;cursor:pointer}
+.burger span{position:absolute;left:6px;right:6px;height:2px;background:var(--ink);transition:transform .4s var(--ease),top .4s,background .3s}
+.burger span:nth-child(1){top:14px}.burger span:nth-child(2){top:24px}
+body.menu-open .burger span:nth-child(1){top:19px;transform:rotate(45deg)}
+body.menu-open .burger span:nth-child(2){top:19px;transform:rotate(-45deg)}
+body.menu-open .burger span{background:var(--paper)}
+body.menu-open .logo{color:var(--paper)}
+body.menu-open .nav{border-color:transparent;background:transparent}
+
+/* мобильное меню */
+.menu{
+  position:fixed;inset:0;background:var(--ink);color:var(--paper);z-index:1050;
+  clip-path:inset(0 0 100% 0);transition:clip-path .65s cubic-bezier(.76,0,.24,1);
+  display:flex;flex-direction:column;justify-content:center;padding:0 8vw;
+}
+.menu.open{clip-path:inset(0)}
+.menu a.m-link{
+  display:flex;align-items:baseline;gap:16px;font-family:'Unbounded';font-weight:900;
+  font-size:clamp(28px,7vw,52px);padding:14px 0;border-bottom:1px solid rgba(237,234,225,.15);
+  transform:translateY(40px);opacity:0;transition:transform .5s var(--ease) var(--d,0s),opacity .5s var(--d,0s),color .3s;
+}
+.menu.open a.m-link{transform:none;opacity:1}
+.menu a.m-link i{font-style:normal;font-family:'JetBrains Mono';font-size:13px;color:var(--orange)}
+.menu a.m-link:hover{color:var(--orange)}
+.menu-foot{margin-top:36px;font-family:'JetBrains Mono';font-size:12px;letter-spacing:.1em;text-transform:uppercase;opacity:.6}
+
+/* ============ ГЕРОЙ ============ */
+.hero{
+  min-height:100svh;position:relative;display:flex;flex-direction:column;
+  padding:120px var(--pad) 40px;overflow:hidden;
+  background-image:linear-gradient(rgba(22,19,16,.05) 1px,transparent 1px);
+  background-size:100% 88px;
+}
+.hero-meta{display:flex;justify-content:space-between;gap:16px;font-family:'JetBrains Mono';font-size:12px;letter-spacing:.14em;text-transform:uppercase}
+.hero-meta .avail{display:flex;align-items:center;gap:8px}
+.dot{width:9px;height:9px;border-radius:50%;background:#22A85F;animation:pulse 1.8s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(34,168,95,.5)}70%{box-shadow:0 0 0 12px rgba(34,168,95,0)}100%{box-shadow:0 0 0 0 rgba(34,168,95,0)}}
+.hero-name{margin-top:clamp(28px,6vh,64px);font-size:clamp(52px,11.5vw,176px);letter-spacing:-.01em;text-transform:uppercase}
+.hero-line{display:block;overflow:hidden;padding-bottom:.06em}
+.hero-line>span{display:inline-block;transform:translateY(118%);transition:transform 1.15s var(--ease);transition-delay:var(--d,0s)}
+body.loaded .hero-line>span{transform:none}
+.hero-outline>span{color:transparent;-webkit-text-stroke:2.5px var(--ink)}
+.hero-star{font-style:normal;color:var(--orange);-webkit-text-stroke:0;display:inline-block;animation:spin 14s linear infinite;margin-left:.05em}
+@keyframes spin{to{transform:rotate(360deg)}}
+.hero-row{display:flex;align-items:flex-end;justify-content:space-between;gap:32px;margin-top:auto;padding-top:clamp(28px,5vh,56px)}
+.hero-left{max-width:600px}
+.hero-tags{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:20px}
+.tag{font-family:'JetBrains Mono';font-size:12px;letter-spacing:.1em;text-transform:uppercase;border:2px solid var(--ink);padding:7px 14px}
+.tag--fill{background:var(--ink);color:var(--paper)}
+.hero-left p{font-size:clamp(16px,1.4vw,19px);max-width:52ch}
+.hero-btns{display:flex;flex-wrap:wrap;gap:14px;margin-top:26px}
+.btn{
+  display:inline-flex;align-items:center;gap:10px;position:relative;overflow:hidden;
+  font-family:'JetBrains Mono';font-size:14px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
+  border:2px solid var(--ink);padding:16px 28px;background:transparent;color:var(--ink);cursor:pointer;
+  transition:color .35s;
+}
+.btn::before{content:'';position:absolute;inset:0;background:var(--ink);transform:translateY(101%);transition:transform .4s var(--ease);z-index:-1}
+.btn:hover::before{transform:none}
+.btn:hover{color:var(--paper)}
+.btn--solid{background:var(--ink);color:var(--paper)}
+.btn--solid::before{background:var(--orange)}
+.btn--solid:hover{border-color:var(--orange)}
+.btn i{font-style:normal;transition:transform .35s var(--ease)}
+.btn:hover i{transform:translateY(4px)}
+/* вращающийся бейдж */
+.badge{position:relative;width:150px;height:150px;flex:none}
+.badge svg{width:100%;height:100%;animation:spin 16s linear infinite}
+.badge text{font-family:'JetBrains Mono';font-size:11.5px;letter-spacing:.22em;fill:var(--ink);text-transform:uppercase}
+.badge-core{position:absolute;inset:0;display:grid;place-items:center;font-size:34px;color:var(--orange)}
+/* декорации */
+.deco{position:absolute;pointer-events:none;z-index:-1}
+.deco-circle{top:12%;right:6%;width:clamp(160px,24vw,340px);aspect-ratio:1;border:2px dashed var(--ink);border-radius:50%;opacity:.5;animation:spin 40s linear infinite}
+.deco-plus{top:22%;left:44%;font-family:'Unbounded';font-weight:900;font-size:34px;color:var(--cobalt);animation:float 6s ease-in-out infinite}
+.deco-sq{bottom:34%;right:22%;width:16px;height:16px;background:var(--orange);animation:float 5s ease-in-out infinite reverse,spin 9s linear infinite}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-18px)}}
+.hero-scroll{position:absolute;left:var(--pad);bottom:36px;display:flex;align-items:center;gap:12px;font-family:'JetBrains Mono';font-size:11px;letter-spacing:.2em;text-transform:uppercase}
+.hero-scroll::before{content:'';width:56px;height:2px;background:var(--ink);transform-origin:left;animation:scrollLine 1.8s var(--ease) infinite}
+@keyframes scrollLine{0%{transform:scaleX(0)}55%{transform:scaleX(1)}100%{transform:scaleX(1);opacity:0}}
+/* интро остальных элементов героя */
+.hero [data-intro]{opacity:0;transform:translateY(28px);transition:opacity .9s ease var(--d,0s),transform .9s var(--ease) var(--d,0s)}
+body.loaded .hero [data-intro]{opacity:1;transform:none}
+
+/* ============ БЕГУЩИЕ СТРОКИ ============ */
+.marquee{overflow:hidden;border-top:2px solid var(--ink);border-bottom:2px solid var(--ink);background:var(--ink);color:var(--paper)}
+.marquee--alt{background:var(--orange);color:var(--ink);border-top:0}
+.m-track{display:flex;width:max-content;animation:marq 26s linear infinite}
+.marquee--alt .m-track{animation-direction:reverse;animation-duration:32s}
+.marquee:hover .m-track{animation-play-state:paused}
+.m-group{display:flex;align-items:center;flex:none}
+.m-item{font-family:'Unbounded';font-weight:700;font-size:clamp(16px,2vw,24px);text-transform:uppercase;padding:14px 0;white-space:nowrap}
+.m-star{color:var(--orange);font-size:clamp(16px,2vw,24px);padding:0 22px}
+.marquee--alt .m-star{color:var(--paper)}
+@keyframes marq{to{transform:translateX(-50%)}}
+
+/* ============ СЕКЦИИ ============ */
+section{padding:clamp(80px,11vw,150px) var(--pad)}
+.s-head{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;border-bottom:2px solid var(--ink);padding-bottom:18px;margin-bottom:clamp(40px,6vw,76px)}
+.s-label{font-family:'JetBrains Mono';font-size:13px;letter-spacing:.16em;text-transform:uppercase}
+.s-label b{color:var(--orange)}
+.s-head h2{font-size:clamp(34px,6vw,72px);text-transform:uppercase}
+.s-note{font-family:'JetBrains Mono';font-size:12px;opacity:.6;text-align:right;max-width:220px}
+
+/* reveal */
+.reveal{opacity:0;transform:translateY(44px);transition:opacity .85s ease var(--d,0s),transform .85s var(--ease) var(--d,0s)}
+.reveal.in{opacity:1;transform:none}
+
+/* ============ ОБО МНЕ ============ */
+.about-grid{display:grid;grid-template-columns:1.25fr .75fr;gap:clamp(32px,5vw,80px);align-items:start}
+.statement{font-family:'Unbounded';font-weight:700;font-size:clamp(22px,3.1vw,42px);line-height:1.28}
+.statement em{font-style:normal;padding:.02em .14em;color:var(--paper)}
+.hl-o{background:var(--orange)}
+.hl-c{background:var(--cobalt)}
+.about-side p{margin-bottom:18px}
+.awards{list-style:none;margin-top:26px;border-top:2px solid var(--ink)}
+.awards li{display:flex;justify-content:space-between;gap:12px;padding:12px 4px;border-bottom:1px solid rgba(22,19,16,.25);font-family:'JetBrains Mono';font-size:13px;transition:padding-left .3s var(--ease),color .3s}
+.awards li::before{content:'→';color:var(--orange);margin-right:10px}
+.awards li:hover{padding-left:14px}
+.sign{margin-top:30px;font-family:'Unbounded';font-weight:900;font-size:26px}
+.sign i{font-style:normal;color:var(--orange)}
+/* статистика */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);border:2px solid var(--ink);margin-top:clamp(48px,7vw,90px)}
+.stat{padding:clamp(20px,3vw,36px);border-right:2px solid var(--ink);transition:background .35s,color .35s}
+.stat:last-child{border-right:0}
+.stat:hover{background:var(--ink);color:var(--paper)}
+.stat:hover .stat-num{color:var(--orange)}
+.stat-num{font-family:'Unbounded';font-weight:900;font-size:clamp(36px,5vw,64px);line-height:1;transition:color .35s}
+.stat-num sup{color:var(--orange);font-size:.5em}
+.stat-cap{font-family:'JetBrains Mono';font-size:12px;letter-spacing:.12em;text-transform:uppercase;margin-top:12px;opacity:.75}
+
+/* ============ НАВЫКИ ============ */
+.skills-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:clamp(36px,5vw,90px)}
+.h3{font-size:clamp(18px,1.8vw,24px);text-transform:uppercase;margin-bottom:26px;display:flex;align-items:center;gap:12px}
+.h3::after{content:'';flex:1;height:2px;background:var(--ink)}
+.bar{margin-bottom:24px}
+.bar-top{display:flex;justify-content:space-between;font-family:'JetBrains Mono';font-size:13px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
+.bar-track{height:16px;border:2px solid var(--ink);padding:2px}
+.bar-fill{height:100%;width:0;background:var(--ink);transition:width 1.4s var(--ease)}
+.bar:nth-child(odd) .bar-fill{background:var(--orange)}
+.bars.in .bar-fill{width:var(--lvl)}
+.bar:nth-child(1) .bar-fill{transition-delay:.05s}.bar:nth-child(2) .bar-fill{transition-delay:.15s}
+.bar:nth-child(3) .bar-fill{transition-delay:.25s}.bar:nth-child(4) .bar-fill{transition-delay:.35s}
+.bar:nth-child(5) .bar-fill{transition-delay:.45s}.bar:nth-child(6) .bar-fill{transition-delay:.55s}
+.chips{display:flex;flex-wrap:wrap;gap:12px}
+.chip{
+  font-family:'JetBrains Mono';font-size:13px;border:2px solid var(--ink);padding:10px 18px;
+  transition:background .3s,color .3s,transform .3s var(--ease),border-color .3s;cursor:default;
+}
+.chip:hover{background:var(--cobalt);border-color:var(--cobalt);color:var(--paper);transform:translateY(-4px) rotate(-2deg)}
+.principles{margin-top:clamp(56px,7vw,96px)}
+.pr{
+  display:grid;grid-template-columns:70px 1fr auto;align-items:center;gap:16px;
+  padding:22px 18px;border-top:2px solid var(--ink);transition:background .35s,color .35s;
+}
+.pr:last-child{border-bottom:2px solid var(--ink)}
+.pr-num{font-family:'JetBrains Mono';font-size:14px;color:var(--orange)}
+.pr-title{font-family:'Unbounded';font-weight:700;font-size:clamp(16px,2.2vw,26px);text-transform:uppercase}
+.pr-arrow{font-size:24px;opacity:0;transform:translateX(-12px);transition:opacity .35s,transform .35s var(--ease)}
+.pr:hover{background:var(--ink);color:var(--paper)}
+.pr:hover .pr-arrow{opacity:1;transform:none;color:var(--orange)}
+
+/* ============ РАБОТЫ ============ */
+.works{display:grid;grid-template-columns:repeat(12,1fr);gap:clamp(22px,3vw,44px)}
+.work{display:flex;flex-direction:column}
+.w-7{grid-column:span 7}.w-5{grid-column:span 5;margin-top:clamp(0px,6vw,90px)}
+.w-12{grid-column:span 12}
+.work-link{display:flex;flex-direction:column;height:100%}
+.work-visual{
+  position:relative;overflow:hidden;border:2px solid var(--ink);
+  transition:transform .5s var(--ease);will-change:transform;
+}
+.w-7 .work-visual{aspect-ratio:4/3}
+.w-5 .work-visual{aspect-ratio:1/1}
+.w-12 .work-visual{aspect-ratio:21/9;min-height:260px}
+.art{position:absolute;inset:0;transition:transform .7s var(--ease)}
+.work:hover .art{transform:scale(1.06)}
+.art-tag{position:absolute;top:14px;left:14px;z-index:2;font-family:'JetBrains Mono';font-size:11px;letter-spacing:.1em;text-transform:uppercase;background:var(--paper);border:2px solid var(--ink);padding:4px 10px}
+.work-cta{
+  position:absolute;left:16px;bottom:16px;z-index:2;font-family:'JetBrains Mono';font-size:12px;
+  letter-spacing:.1em;text-transform:uppercase;background:var(--ink);color:var(--paper);padding:9px 16px;
+  transform:translateY(180%);transition:transform .45s var(--ease);
+}
+.work:hover .work-cta{transform:none}
+/* обложка 1 — айдентика */
+.art-brand{background:var(--orange);display:grid;place-items:center}
+.art-brand .big-star{font-family:'Unbounded';font-weight:900;font-size:clamp(110px,16vw,210px);color:var(--paper);line-height:1;animation:spin 26s linear infinite}
+/* обложка 2 — финтех */
+.art-pulse{
+  background:var(--cobalt);
+  background-image:linear-gradient(rgba(255,255,255,.13) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.13) 1px,transparent 1px);
+  background-size:44px 44px;
+}
+.art-pulse svg{position:absolute;inset:0;width:100%;height:100%}
+.pulse-line{fill:none;stroke:var(--paper);stroke-width:4;stroke-linejoin:round;stroke-dasharray:760;stroke-dashoffset:760;animation:dash 3.4s ease-in-out infinite}
+@keyframes dash{0%{stroke-dashoffset:760}60%{stroke-dashoffset:0}100%{stroke-dashoffset:-760}}
+/* обложка 3 — фестиваль */
+.art-noise{background:var(--ink);color:var(--paper);display:grid;place-items:center}
+.art-noise::before{
+  content:'';position:absolute;inset:-20px;
+  background-image:radial-gradient(rgba(237,234,225,.85) 1.4px,transparent 1.5px);
+  background-size:16px 16px;animation:drift 6s linear infinite;
+  -webkit-mask-image:radial-gradient(circle at 50% 50%,#000 30%,transparent 75%);
+          mask-image:radial-gradient(circle at 50% 50%,#000 30%,transparent 75%);
+}
+@keyframes drift{to{background-position:16px 16px}}
+.noise-word{
+  position:relative;font-family:'Unbounded';font-weight:900;font-size:clamp(70px,13vw,180px);
+  letter-spacing:.04em;color:transparent;-webkit-text-stroke:2px var(--paper);
+  transform:skewX(-6deg);transition:color .4s;
+}
+.work:hover .noise-word{color:var(--orange);-webkit-text-stroke:2px var(--orange)}
+/* обложка 4 — платформа */
+.art-atlas{background:var(--green);display:grid;place-items:center}
+.art-atlas::before,.art-atlas::after{
+  content:'';position:absolute;width:160%;aspect-ratio:1;border-radius:50%;
+  background:repeating-radial-gradient(circle,transparent 0 26px,rgba(237,234,225,.3) 26px 27px);
+}
+.art-atlas::before{top:-60%;left:-50%;animation:spin 70s linear infinite}
+.art-atlas::after{bottom:-70%;right:-55%;animation:spin 90s linear infinite reverse}
+.atlas-word{position:relative;z-index:1;font-family:'Unbounded';font-weight:900;font-size:clamp(60px,9vw,130px);color:var(--paper)}
+.atlas-coord{position:absolute;right:16px;bottom:14px;z-index:1;font-family:'JetBrains Mono';font-size:11px;color:var(--paper);letter-spacing:.12em}
+/* обложка 5 — упаковка */
+.art-forma{background:var(--yellow);display:grid;place-items:center}
+.forma-circle{
+  width:min(62%,300px);aspect-ratio:1;border:3px solid var(--ink);border-radius:50%;
+  display:grid;place-items:center;overflow:hidden;animation:spin 30s linear infinite;
+  background:repeating-conic-gradient(var(--ink) 0 25%,transparent 0 50%);background-size:44px 44px;
+}
+.forma-letter{font-family:'Unbounded';font-weight:900;font-size:clamp(60px,8vw,110px);color:var(--orange);background:var(--paper);border:3px solid var(--ink);padding:.05em .2em;animation:spin 30s linear infinite reverse}
+/* инфо карточки */
+.work-info{
+  display:flex;align-items:center;justify-content:space-between;gap:14px;
+  border:2px solid var(--ink);border-top:0;padding:16px 20px;background:var(--paper);
+  transition:background .35s,color .35s;
+}
+.work:hover .work-info{background:var(--ink);color:var(--paper)}
+.work-title{font-family:'Unbounded';font-weight:700;font-size:clamp(17px,1.8vw,23px);text-transform:uppercase}
+.work-tags{font-family:'JetBrains Mono';font-size:12px;opacity:.7;margin-top:4px}
+.work-right{text-align:right;flex:none}
+.work-idx{font-family:'JetBrains Mono';font-size:12px;color:var(--orange)}
+.work-year{font-family:'JetBrains Mono';font-size:12px}
+.work-arrow{display:inline-block;font-size:22px;transition:transform .35s var(--ease)}
+.work:hover .work-arrow{transform:translate(5px,-5px) rotate(45deg);color:var(--orange)}
+
+/* ============ ОПЫТ ============ */
+.tl{position:relative;padding-left:clamp(30px,4vw,52px);max-width:1000px}
+.tl::before{content:'';position:absolute;left:8px;top:6px;bottom:6px;width:2px;background:var(--ink)}
+.tl-item{position:relative;padding:clamp(22px,3vw,34px) 0;border-bottom:1px solid rgba(22,19,16,.25)}
+.tl-item::before{
+  content:'';position:absolute;left:calc(-1*clamp(30px,4vw,52px) + 2px);top:calc(clamp(22px,3vw,34px) + 12px);
+  width:14px;height:14px;border-radius:50%;background:var(--orange);border:2px solid var(--ink);
+  transition:background .3s,transform .3s var(--ease);
+}
+.tl-item:hover::before{background:var(--cobalt);transform:scale(1.35)}
+.tl-grid{display:grid;grid-template-columns:minmax(130px,190px) 1fr;gap:10px 32px}
+.tl-years{font-family:'JetBrains Mono';font-size:14px;color:var(--orange);font-weight:700;letter-spacing:.06em}
+.tl-role{font-family:'Unbounded';font-weight:700;font-size:clamp(17px,2vw,24px);text-transform:uppercase}
+.tl-place{font-family:'JetBrains Mono';font-size:13px;opacity:.7;margin-top:4px}
+.tl-desc{grid-column:2;max-width:60ch;margin-top:10px}
+
+/* ============ КОНТАКТЫ ============ */
+.contact{background:var(--ink);color:var(--paper);border-top:2px solid var(--ink)}
+.contact .s-head{border-color:var(--paper)}
+.contact .s-note{opacity:.5}
+.contact-big{font-size:clamp(40px,8.5vw,120px);text-transform:uppercase;line-height:1}
+.contact-big .outline{color:transparent;-webkit-text-stroke:2px var(--paper)}
+.contact-big .accent{color:var(--orange)}
+.contact-mail{
+  display:inline-flex;align-items:center;gap:16px;margin-top:clamp(36px,5vw,60px);
+  font-family:'Unbounded';font-weight:700;font-size:clamp(20px,4.4vw,52px);
+  border-bottom:3px solid var(--paper);padding-bottom:8px;transition:color .35s,border-color .35s;
+}
+.contact-mail i{font-style:normal;display:inline-block;transition:transform .35s var(--ease)}
+.contact-mail:hover{color:var(--orange);border-color:var(--orange)}
+.contact-mail:hover i{transform:translate(6px,-6px)}
+.socials{margin-top:clamp(44px,6vw,80px);border-top:1px solid rgba(237,234,225,.25)}
+.soc{
+  display:grid;grid-template-columns:150px 1fr auto;align-items:center;gap:16px;
+  padding:20px 4px;border-bottom:1px solid rgba(237,234,225,.25);
+  transition:padding-left .35s var(--ease),color .3s;
+}
+.soc:hover{padding-left:20px;color:var(--orange)}
+.soc-name{font-family:'JetBrains Mono';font-size:13px;text-transform:uppercase;letter-spacing:.12em}
+.soc-handle{font-family:'Unbounded';font-weight:700;font-size:clamp(15px,1.8vw,20px)}
+.soc-arrow{font-size:22px;transition:transform .35s var(--ease)}
+.soc:hover .soc-arrow{transform:translate(4px,-4px)}
+.contact-note{display:flex;align-items:center;gap:10px;margin-top:34px;font-family:'JetBrains Mono';font-size:13px;letter-spacing:.1em;text-transform:uppercase}
+.footer{
+  display:flex;flex-wrap:wrap;justify-content:space-between;gap:14px;
+  margin-top:clamp(56px,8vw,110px);padding-top:24px;border-top:1px solid rgba(237,234,225,.25);
+  font-family:'JetBrains Mono';font-size:12px;letter-spacing:.1em;text-transform:uppercase;opacity:.75;
+}
+.footer b{color:var(--orange)}
+
+/* ============ АДАПТИВ ============ */
+@media (max-width:1000px){
+  .about-grid,.skills-grid{grid-template-columns:1fr}
+  .w-7,.w-5{grid-column:span 12}
+  .w-5{margin-top:0}
+  .w-5 .work-visual{aspect-ratio:4/3}
+  .badge{display:none}
+}
+@media (max-width:900px){
+  .nav-links,.nav-cta{display:none}
+  .burger{display:block}
+}
+@media (max-width:640px){
+  .stats{grid-template-columns:1fr 1fr}
+  .stat:nth-child(2n){border-right:0}
+  .stat:nth-child(-n+2){border-bottom:2px solid var(--ink)}
+  .tl-grid{grid-template-columns:1fr}
+  .tl-desc{grid-column:1}
+  .soc{grid-template-columns:1fr auto}
+  .soc-handle{grid-column:1/-1}
+  .hero-scroll{display:none}
+  .pr{grid-template-columns:44px 1fr auto}
+  .s-note{display:none}
+}
+
+/* ============ REDUCED MOTION ============ */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+  .reveal,.hero [data-intro],.hero-line>span{opacity:1!important;transform:none!important}
+  .bars .bar-fill{width:var(--lvl)!important}
+  .preloader{display:none}
+}
+</style>
+</head>
+<body class="locked">
+
+<div class="grain" aria-hidden="true"></div>
+<div class="cursor-dot" aria-hidden="true"></div>
+<div class="cursor-ring" aria-hidden="true"></div>
+<div id="progress" aria-hidden="true"></div>
+
+<!-- ПРЕЛОАДЕР -->
+<div class="preloader" id="preloader" aria-hidden="true">
+  <div class="pre-top"><span>Марк Волков — портфолио</span><span>дизайн <b>✳</b> 2026</span></div>
+  <div class="pre-count" id="preCount">000</div>
+  <div class="pre-bar" id="preBar"></div>
+</div>
+
+<!-- НАВИГАЦИЯ -->
+<header class="nav" id="nav">
+  <a class="logo" href="#top">В<em>✳</em>ЛКОВ</a>
+  <nav aria-label="Основная навигация">
+    <ul class="nav-links">
+      <li><a href="#about">Обо мне</a></li>
+      <li><a href="#skills">Навыки</a></li>
+      <li><a href="#works">Работы</a></li>
+      <li><a href="#exp">Опыт</a></li>
+      <li><a href="#contact">Контакты</a></li>
+    </ul>
+  </nav>
+  <a class="nav-cta" href="#contact">Нанять меня</a>
+  <button class="burger" id="burger" aria-label="Открыть меню" aria-expanded="false"><span></span><span></span></button>
+</header>
+
+<!-- МОБИЛЬНОЕ МЕНЮ -->
+<div class="menu" id="menu">
+  <a class="m-link" style="--d:.08s" href="#about"><i>01</i>Обо мне</a>
+  <a class="m-link" style="--d:.14s" href="#skills"><i>02</i>Навыки</a>
+  <a class="m-link" style="--d:.20s" href="#works"><i>03</i>Работы</a>
+  <a class="m-link" style="--d:.26s" href="#exp"><i>04</i>Опыт</a>
+  <a class="m-link" style="--d:.32s" href="#contact"><i>05</i>Контакты</a>
+  <div class="menu-foot">hello@volkov.design — Москва</div>
+</div>
+
+<main id="top">
+
+  <!-- ГЕРОЙ -->
+  <section class="hero" style="padding-bottom:90px">
+    <div class="deco deco-circle" aria-hidden="true"></div>
+    <div class="deco deco-plus" aria-hidden="true">+</div>
+    <div class="deco deco-sq" aria-hidden="true"></div>
+
+    <div class="hero-meta" data-intro style="--d:.55s">
+      <span>Портфолио — 2026</span>
+      <span class="avail"><span class="dot"></span>открыт к проектам</span>
+      <span>Москва, 55.7558° N</span>
+    </div>
+
+    <h1 class="hero-name" id="heroName">
+      <span class="hero-line"><span style="--d:.15s">Марк</span></span>
+      <span class="hero-line hero-outline"><span style="--d:.28s">Волков<em class="hero-star">✳</em></span></span>
+    </h1>
+
+    <div class="hero-row">
+      <div class="hero-left">
+        <div class="hero-tags" data-intro style="--d:.65s">
+          <span class="tag tag--fill">Графический дизайнер</span>
+          <span class="tag">&amp; арт-директор</span>
+        </div>
+        <p data-intro style="--d:.75s">Проектирую айдентику, интерфейсы и сайты, которые запоминаются с первого экрана. Работаю на стыке смысла и формы: от стратегии — до последнего пикселя.</p>
+        <div class="hero-btns" data-intro style="--d:.85s">
+          <a class="btn btn--solid magnetic" href="#works">Смотреть работы <i>↓</i></a>
+          <a class="btn magnetic" href="#" data-soon>Скачать PDF <i>↗</i></a>
+        </div>
+      </div>
+      <div class="badge" data-intro style="--d:.95s" aria-hidden="true">
+        <svg viewBox="0 0 120 120">
+          <defs><path id="circ" d="M60,60 m-46,0 a46,46 0 1,1 92,0 a46,46 0 1,1 -92,0"/></defs>
+          <text><textPath href="#circ">открыт к проектам • открыт к проектам • </textPath></text>
+        </svg>
+        <span class="badge-core">✳</span>
+      </div>
+    </div>
+
+    <div class="hero-scroll">листайте вниз</div>
+  </section>
+
+  <!-- БЕГУЩИЕ СТРОКИ -->
+  <div class="marquee" aria-hidden="true">
+    <div class="m-track">
+      <div class="m-group">
+        <span class="m-item">Айдентика</span><span class="m-star">✳</span><span class="m-item">Интерфейсы</span><span class="m-star">✳</span><span class="m-item">Веб-дизайн</span><span class="m-star">✳</span><span class="m-item">Моушн</span><span class="m-star">✳</span><span class="m-item">Плакаты</span><span class="m-star">✳</span><span class="m-item">Упаковка</span><span class="m-star">✳</span><span class="m-item">Леттеринг</span><span class="m-star">✳</span>
+      </div>
+      <div class="m-group">
+        <span class="m-item">Айдентика</span><span class="m-star">✳</span><span class="m-item">Интерфейсы</span><span class="m-star">✳</span><span class="m-item">Веб-дизайн</span><span class="m-star">✳</span><span class="m-item">Моушн</span><span class="m-star">✳</span><span class="m-item">Плакаты</span><span class="m-star">✳</span><span class="m-item">Упаковка</span><span class="m-star">✳</span><span class="m-item">Леттеринг</span><span class="m-star">✳</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ОБО МНЕ -->
+  <section id="about">
+    <div class="s-head reveal">
+      <div><div class="s-label"><b>01</b> / Обо мне</div><h2>Дизайн как система</h2></div>
+      <div class="s-note">кратко о том, кто я и как работаю</div>
+    </div>
+    <div class="about-grid">
+      <p class="statement reveal">Я верю, что сильный дизайн — это <em class="hl-o">система</em>, а не набор красивых экранов. Сначала — смысл и стратегия, потом — <em class="hl-c">форма</em>, сетка и типографика, которые работают на бизнес.</p>
+      <div class="about-side reveal" style="--d:.15s">
+        <p>За 8 лет прошёл путь от баннеров и плакатов до комплексных айдентик для компаний из России, Казахстана и Европы. Люблю сложные брифы, жёсткие дедлайны и честную типографику.</p>
+        <p>Веду проекты от первого созвона до передачи в разработку и авторского надзора.</p>
+        <ul class="awards">
+          <li><span>Red Dot Award — Brands</span><span>2024</span></li>
+          <li><span>Behance Best of Branding ×3</span><span>2023–25</span></li>
+          <li><span>Awwwards Honorable Mention</span><span>2024</span></li>
+          <li><span>Фестиваль «Идея!» — золото</span><span>2023</span></li>
+        </ul>
+        <div class="sign">М.Волков <i>✳</i></div>
+      </div>
+    </div>
+    <div class="stats reveal" style="--d:.1s">
+      <div class="stat"><div class="stat-num"><span data-count="8">0</span><sup>+</sup></div><div class="stat-cap">лет в дизайне</div></div>
+      <div class="stat"><div class="stat-num"><span data-count="120">0</span><sup>+</sup></div><div class="stat-cap">проектов сдано</div></div>
+      <div class="stat"><div class="stat-num"><span data-count="46">0</span></div><div class="stat-cap">постоянных клиентов</div></div>
+      <div class="stat"><div class="stat-num"><span data-count="9">0</span></div><div class="stat-cap">отраслевых наград</div></div>
+    </div>
+  </section>
+
+  <!-- НАВЫКИ -->
+  <section id="skills">
+    <div class="s-head reveal">
+      <div><div class="s-label"><b>02</b> / Навыки</div><h2>Что умею</h2></div>
+      <div class="s-note">проценты — не vanity metric, а часы практики</div>
+    </div>
+    <div class="skills-grid">
+      <div class="reveal">
+        <h3 class="h3">Ключевые навыки</h3>
+        <div class="bars" id="bars">
+          <div class="bar"><div class="bar-top"><span>Фирменный стиль</span><span>95%</span></div><div class="bar-track"><div class="bar-fill" style="--lvl:95%"></div></div></div>
+          <div class="bar"><div class="bar-top"><span>Типографика и вёрстка</span><span>92%</span></div><div class="bar-track"><div class="bar-fill" style="--lvl:92%"></div></div></div>
+          <div class="bar"><div class="bar-top"><span>UI/UX-дизайн</span><span>90%</span></div><div class="bar-track"><div class="bar-fill" style="--lvl:90%"></div></div></div>
+          <div class="bar"><div class="bar-top"><span>Арт-дирекшн</span><span>88%</span></div><div class="bar-track"><div class="bar-fill" style="--lvl:88%"></div></div></div>
+          <div class="bar"><div class="bar-top"><span>Моушн-дизайн</span><span>78%</span></div><div class="bar-track"><div class="bar-fill" style="--lvl:78%"></div></div></div>
+          <div class="bar"><div class="bar-top"><span>Иллюстрация</span><span>72%</span></div><div class="bar-track"><div class="bar-fill" style="--lvl:72%"></div></div></div>
+        </div>
+      </div>
+      <div class="reveal" style="--d:.15s">
+        <h3 class="h3">Инструменты</h3>
+        <div class="chips">
+          <span class="chip">Figma</span><span class="chip">Illustrator</span><span class="chip">Photoshop</span>
+          <span class="chip">InDesign</span><span class="chip">After Effects</span><span class="chip">Blender</span>
+          <span class="chip">Procreate</span><span class="chip">Cinema 4D</span><span class="chip">Notion</span>
+          <span class="chip">Tilda</span><span class="chip">Readymag</span>
+        </div>
+        <h3 class="h3" style="margin-top:44px">Языки</h3>
+        <div class="chips">
+          <span class="chip">Русский — родной</span><span class="chip">Английский — C1</span><span class="chip">Немецкий — A2</span>
+        </div>
+      </div>
+    </div>
+    <div class="principles">
+      <div class="pr reveal"><span class="pr-num">/01</span><span class="pr-title">Смысл раньше формы</span><span class="pr-arrow">→</span></div>
+      <div class="pr reveal" style="--d:.06s"><span class="pr-num">/02</span><span class="pr-title">Сетка — это свобода</span><span class="pr-arrow">→</span></div>
+      <div class="pr reveal" style="--d:.12s"><span class="pr-num">/03</span><span class="pr-title">Типографика громче картинок</span><span class="pr-arrow">→</span></div>
+      <div class="pr reveal" style="--d:.18s"><span class="pr-num">/04</span><span class="pr-title">Дедлайн — часть дизайна</span><span class="pr-arrow">→</span></div>
+    </div>
+  </section>
+
+  <!-- РАБОТЫ -->
+  <section id="works">
+    <div class="s-head reveal">
+      <div><div class="s-label"><b>03</b> / Работы</div><h2>Избранные проекты</h2></div>
+      <div class="s-note">2023 — 2026 · полное портфолио по запросу</div>
+    </div>
+    <div class="works">
+
+      <article class="work w-7 reveal">
+        <a class="work-link" href="#" data-soon>
+          <div class="work-visual" data-tilt>
+            <div class="art art-brand"><span class="art-tag">брендинг</span><span class="big-star">✳</span><span class="work-cta">Смотреть кейс ↗</span></div>
+          </div>
+          <div class="work-info">
+            <div><div class="work-title">«Яркость»</div><div class="work-tags">айдентика · логотип · гайдлайн</div></div>
+            <div class="work-right"><div class="work-idx">01</div><div class="work-year">2025</div><span class="work-arrow">↗</span></div>
+          </div>
+        </a>
+      </article>
+
+      <article class="work w-5 reveal" style="--d:.12s">
+        <a class="work-link" href="#" data-soon>
+          <div class="work-visual" data-tilt>
+            <div class="art art-pulse">
+              <span class="art-tag">продукт</span>
+              <svg viewBox="0 0 400 300" preserveAspectRatio="none" aria-hidden="true">
+                <polyline class="pulse-line" points="0,160 70,160 100,80 130,235 160,110 190,160 400,160"/>
+              </svg>
+              <span class="work-cta">Смотреть кейс ↗</span>
+            </div>
+          </div>
+          <div class="work-info">
+            <div><div class="work-title">«Пульс»</div><div class="work-tags">финтех-приложение · UI-кит</div></div>
+            <div class="work-right"><div class="work-idx">02</div><div class="work-year">2024</div><span class="work-arrow">↗</span></div>
+          </div>
+        </a>
+      </article>
+
+      <article class="work w-5 reveal">
+        <a class="work-link" href="#" data-soon>
+          <div class="work-visual" data-tilt>
+            <div class="art art-atlas"><span class="art-tag">веб</span><span class="atlas-word">АТЛАС</span><span class="atlas-coord">55.75° N / 37.61° E</span><span class="work-cta">Смотреть кейс ↗</span></div>
+          </div>
+          <div class="work-info">
+            <div><div class="work-title">«Атлас»</div><div class="work-tags">платформа · веб-дизайн · система</div></div>
+            <div class="work-right"><div class="work-idx">03</div><div class="work-year">2024</div><span class="work-arrow">↗</span></div>
+          </div>
+        </a>
+      </article>
+
+      <article class="work w-7 reveal" style="--d:.12s">
+        <a class="work-link" href="#" data-soon>
+          <div class="work-visual" data-tilt>
+            <div class="art art-forma"><span class="art-tag">упаковка</span><div class="forma-circle"><span class="forma-letter">Ф</span></div><span class="work-cta">Смотреть кейс ↗</span></div>
+          </div>
+          <div class="work-info">
+            <div><div class="work-title">«Форма»</div><div class="work-tags">упаковка · леттеринг · печать</div></div>
+            <div class="work-right"><div class="work-idx">04</div><div class="work-year">2023</div><span class="work-arrow">↗</span></div>
+          </div>
+        </a>
+      </article>
+
+      <article class="work w-12 reveal">
+        <a class="work-link" href="#" data-soon>
+          <div class="work-visual" data-tilt>
+            <div class="art art-noise"><span class="art-tag">плакат · моушн</span><span class="noise-word">ШУМ</span><span class="work-cta">Смотреть кейс ↗</span></div>
+          </div>
+          <div class="work-info">
+            <div><div class="work-title">Фестиваль «Шум»</div><div class="work-tags">плакатная серия · афиши · моушн-сопровождение · 40+ носителей</div></div>
+            <div class="work-right"><div class="work-idx">05</div><div class="work-year">2023</div><span class="work-arrow">↗</span></div>
+          </div>
+        </a>
+      </article>
+
+    </div>
+  </section>
+
+  <!-- КЛИЕНТЫ -->
+  <div class="marquee marquee--alt" aria-hidden="true">
+    <div class="m-track">
+      <div class="m-group">
+        <span class="m-item">Слой</span><span class="m-star">✳</span><span class="m-item">Ритм</span><span class="m-star">✳</span><span class="m-item">Атлас</span><span class="m-star">✳</span><span class="m-item">Форма</span><span class="m-star">✳</span><span class="m-item">Шум</span><span class="m-star">✳</span><span class="m-item">Север</span><span class="m-star">✳</span><span class="m-item">Дом Культур</span><span class="m-star">✳</span><span class="m-item">Восток</span><span class="m-star">✳</span>
+      </div>
+      <div class="m-group">
+        <span class="m-item">Слой</span><span class="m-star">✳</span><span class="m-item">Ритм</span><span class="m-star">✳</span><span class="m-item">Атлас</span><span class="m-star">✳</span><span class="m-item">Форма</span><span class="m-star">✳</span><span class="m-item">Шум</span><span class="m-star">✳</span><span class="m-item">Север</span><span class="m-star">✳</span><span class="m-item">Дом Культур</span><span class="m-star">✳</span><span class="m-item">Восток</span><span class="m-star">✳</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ОПЫТ -->
+  <section id="exp">
+    <div class="s-head reveal">
+      <div><div class="s-label"><b>04</b> / Опыт</div><h2>Где работал</h2></div>
+      <div class="s-note">2017 — настоящее время</div>
+    </div>
+    <div class="tl">
+      <div class="tl-item reveal">
+        <div class="tl-grid">
+          <div class="tl-years">2023 — н. в.</div>
+          <div><div class="tl-role">Арт-директор</div><div class="tl-place">студия «Слой» · Москва</div></div>
+          <p class="tl-desc">Руковожу командой из 6 дизайнеров. Айдентика и сайты для брендов из ритейла, культуры и IT. Выстроил дизайн-процесс: от брифа до авторского надзора — сроки сдачи выросли на 30%.</p>
+        </div>
+      </div>
+      <div class="tl-item reveal" style="--d:.08s">
+        <div class="tl-grid">
+          <div class="tl-years">2020 — 2023</div>
+          <div><div class="tl-role">Ведущий продуктовый дизайнер</div><div class="tl-place">финтех «Ритм» · Москва</div></div>
+          <p class="tl-desc">Спроектировал с нуля мобильное приложение на 400k пользователей, собрал UI-кит на 200+ компонентов и дизайн-систему, которую подхватила разработка.</p>
+        </div>
+      </div>
+      <div class="tl-item reveal" style="--d:.16s">
+        <div class="tl-grid">
+          <div class="tl-years">2018 — 2020</div>
+          <div><div class="tl-role">Дизайнер</div><div class="tl-place">бюро «Копирка» · Санкт-Петербург</div></div>
+          <p class="tl-desc">Плакатные серии, упаковка и полиграфия для культурных институций. Научился дружить с типографиями и препрессом.</p>
+        </div>
+      </div>
+      <div class="tl-item reveal" style="--d:.24s">
+        <div class="tl-grid">
+          <div class="tl-years">2017 — 2018</div>
+          <div><div class="tl-role">Фриланс-дизайнер</div><div class="tl-place">проекты из России и СНГ</div></div>
+          <p class="tl-desc">Логотипы, лендинги, SMM-графика. Первые клиенты, первые дедлайны, первая любовь к сеткам.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- КОНТАКТЫ -->
+  <section id="contact" class="contact">
+    <div class="s-head reveal">
+      <div><div class="s-label"><b>05</b> / Контакты</div><h2>Связаться</h2></div>
+      <div class="s-note">отвечаю в течение рабочего дня</div>
+    </div>
+    <h2 class="contact-big reveal">
+      <span class="outline">Давайте</span><br>
+      <span class="outline">сделаем</span> <span class="accent">круто</span>
+    </h2>
+    <a class="contact-mail reveal" style="--d:.1s" href="mailto:hello@volkov.design">hello@volkov.design <i>↗</i></a>
+    <div class="socials">
+      <a class="soc reveal" href="https://t.me/volkovdesign" target="_blank" rel="noopener">
+        <span class="soc-name">Telegram</span><span class="soc-handle">@volkovdesign</span><span class="soc-arrow">↗</span>
+      </a>
+      <a class="soc reveal" style="--d:.06s" href="https://behance.net/volkov" target="_blank" rel="noopener">
+        <span class="soc-name">Behance</span><span class="soc-handle">/volkov</span><span class="soc-arrow">↗</span>
+      </a>
+      <a class="soc reveal" style="--d:.12s" href="https://dribbble.com/volkov" target="_blank" rel="noopener">
+        <span class="soc-name">Dribbble</span><span class="soc-handle">/volkov</span><span class="soc-arrow">↗</span>
+      </a>
+      <a class="soc reveal" style="--d:.18s" href="https://vk.com/volkovdesign" target="_blank" rel="noopener">
+        <span class="soc-name">VK</span><span class="soc-handle">/volkovdesign</span><span class="soc-arrow">↗</span>
+      </a>
+    </div>
+    <div class="contact-note reveal"><span class="dot"></span> сейчас свободен для фриланса и коллабораций</div>
+    <footer class="footer">
+      <span>© <span id="year">2026</span> Марк Волков — сделано вручную, без шаблонов</span>
+      <span>Москва — <b id="clock">--:--:--</b></span>
+      <span>дизайн <b>✳</b> код <b>✳</b> смысл</span>
+    </footer>
+  </section>
+
+</main>
+
+<button id="toTop" aria-label="Наверх">↑</button>
+
+<script>
+(function(){
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const finePointer = matchMedia('(pointer: fine)').matches;
+  const body = document.body;
+
+  /* ---------- Прелоадер ---------- */
+  const pre = document.getElementById('preloader');
+  const preCount = document.getElementById('preCount');
+  const preBar = document.getElementById('preBar');
+  function finishLoad(){
+    body.classList.add('loaded'); body.classList.remove('locked');
+    pre.classList.add('done');
+    setTimeout(()=>pre.remove(), 1400);
+  }
+  if(reduced){ finishLoad(); }
+  else{
+    const dur = 1500; let start = null;
+    function step(ts){
+      if(!start) start = ts;
+      const p = Math.min((ts-start)/dur, 1);
+      const eased = 1 - Math.pow(1-p, 3);
+      const val = Math.round(eased*100);
+      preCount.textContent = String(val).padStart(3,'0');
+      preBar.style.width = val + '%';
+      if(p < 1) requestAnimationFrame(step); else setTimeout(finishLoad, 200);
+    }
+    requestAnimationFrame(step);
+  }
+
+  /* ---------- Кастомный курсор ---------- */
+  if(finePointer && !reduced){
+    body.classList.add('cursor-on');
+    const dot = document.querySelector('.cursor-dot');
+    const ring = document.querySelector('.cursor-ring');
+    let mx = innerWidth/2, my = innerHeight/2, rx = mx, ry = my;
+    addEventListener('mousemove', e=>{
+      mx = e.clientX; my = e.clientY;
+      dot.style.transform = `translate(${mx}px,${my}px) translate(-50%,-50%)`;
+    });
+    (function loop(){
+      rx += (mx-rx)*0.16; ry += (my-ry)*0.16;
+      ring.style.transform = `translate(${rx}px,${ry}px) translate(-50%,-50%)`;
+      requestAnimationFrame(loop);
+    })();
+    document.addEventListener('mouseover', e=>{
+      if(e.target.closest('a,button,.chip,.work,.pr')) ring.classList.add('hot');
+    });
+    document.addEventListener('mouseout', e=>{
+      if(e.target.closest('a,button,.chip,.work,.pr')) ring.classList.remove('hot');
+    });
+  }
+
+  /* ---------- Скролл: прогресс, нав, кнопка вверх, параллакс ---------- */
+  const progress = document.getElementById('progress');
+  const nav = document.getElementById('nav');
+  const toTop = document.getElementById('toTop');
+  const heroName = document.getElementById('heroName');
+  let ticking = false;
+  function onScroll(){
+    const y = scrollY;
+    const h = document.documentElement.scrollHeight - innerHeight;
+    progress.style.width = (h ? y/h*100 : 0) + '%';
+    nav.classList.toggle('scrolled', y > 40);
+    toTop.classList.toggle('show', y > 600);
+    if(!reduced && heroName && y < innerHeight){
+      heroName.style.transform = `translateY(${y*0.18}px)`;
+      heroName.style.opacity = Math.max(1 - y/(innerHeight*0.9), 0);
+    }
+    ticking = false;
+  }
+  addEventListener('scroll', ()=>{ if(!ticking){ requestAnimationFrame(onScroll); ticking = true; } }, {passive:true});
+  onScroll();
+  toTop.addEventListener('click', ()=>scrollTo({top:0, behavior:'smooth'}));
+
+  /* ---------- Мобильное меню ---------- */
+  const burger = document.getElementById('burger');
+  const menu = document.getElementById('menu');
+  function toggleMenu(force){
+    const open = force !== undefined ? force : !menu.classList.contains('open');
+    menu.classList.toggle('open', open);
+    body.classList.toggle('menu-open', open);
+    body.classList.toggle('locked', open);
+    burger.setAttribute('aria-expanded', open);
+  }
+  burger.addEventListener('click', ()=>toggleMenu());
+  menu.querySelectorAll('a').forEach(a=>a.addEventListener('click', ()=>toggleMenu(false)));
+
+  /* ---------- Reveal на скролле ---------- */
+  const io = new IntersectionObserver(entries=>{
+    entries.forEach(en=>{
+      if(en.isIntersecting){ en.target.classList.add('in'); io.unobserve(en.target); }
+    });
+  }, {threshold:.15, rootMargin:'0px 0px -40px 0px'});
+  document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+
+  /* ---------- Полосы навыков ---------- */
+  const bars = document.getElementById('bars');
+  if(bars){
+    new IntersectionObserver((en,obs)=>{
+      if(en[0].isIntersecting){ bars.classList.add('in'); obs.disconnect(); }
+    },{threshold:.3}).observe(bars);
+  }
+
+  /* ---------- Счётчики ---------- */
+  const counters = document.querySelectorAll('[data-count]');
+  const cObs = new IntersectionObserver((en)=>{
+    en.forEach(e=>{
+      if(!e.isIntersecting) return;
+      const el = e.target, target = +el.dataset.count;
+      cObs.unobserve(el);
+      if(reduced){ el.textContent = target; return; }
+      const dur = 1600; let s = null;
+      function tick(ts){
+        if(!s) s = ts;
+        const p = Math.min((ts-s)/dur,1);
+        el.textContent = Math.round((1-Math.pow(1-p,4))*target);
+        if(p<1) requestAnimationFrame(tick);
+      }
+      requestAnimationFrame(tick);
+    });
+  },{threshold:.5});
+  counters.forEach(c=>cObs.observe(c));
+
+  /* ---------- Tilt карточек ---------- */
+  if(finePointer && !reduced){
+    document.querySelectorAll('[data-tilt]').forEach(card=>{
+      card.addEventListener('mousemove', e=>{
+        const r = card.getBoundingClientRect();
+        const px = (e.clientX-r.left)/r.width - .5;
+        const py = (e.clientY-r.top)/r.height - .5;
+        card.style.transform = `perspective(900px) rotateX(${py*-7}deg) rotateY(${px*7}deg)`;
+      });
+      card.addEventListener('mouseleave', ()=>{ card.style.transform = ''; });
+    });
+    /* магнитные кнопки */
+    document.querySelectorAll('.magnetic').forEach(btn=>{
+      btn.addEventListener('mousemove', e=>{
+        const r = btn.getBoundingClientRect();
+        const x = e.clientX - r.left - r.width/2;
+        const y = e.clientY - r.top - r.height/2;
+        btn.style.transform = `translate(${x*0.18}px,${y*0.28}px)`;
+      });
+      btn.addEventListener('mouseleave', ()=>{ btn.style.transform = ''; });
+    });
+  }
+
+  /* ---------- Кнопки «скоро» ---------- */
+  document.querySelectorAll('[data-soon]').forEach(a=>{
+    a.addEventListener('click', e=>{
+      e.preventDefault();
+      const orig = a.innerHTML;
+      a.innerHTML = 'уже скоро ✳';
+      setTimeout(()=>{ a.innerHTML = orig; }, 1300);
+    });
+  });
+
+  /* ---------- Часы и год ---------- */
+  const clock = document.getElementById('clock');
+  function tickClock(){
+    clock.textContent = new Intl.DateTimeFormat('ru-RU',
+      {hour:'2-digit',minute:'2-digit',second:'2-digit',timeZone:'Europe/Moscow'}).format(new Date());
+  }
+  tickClock(); setInterval(tickClock, 1000);
+  document.getElementById('year').textContent = new Date().getFullYear();
+})();
+</script>
+</body>
+</html>
