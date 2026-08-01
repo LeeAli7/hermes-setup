@@ -1,0 +1,14 @@
+[
+    {"name": "_c_WBKFRo", "value": "CbGiagGEaQMPsUBuHliSPhdcq5jmx0rdLtzmYoW9", "domain": ".qwen.ai", "path": "/", "secure": false, "httpOnly": false, "sameSite": null, "expirationDate": 1816870421},
+    {"name": "cnaui", "value": "de1025e8-fe25-42f6-8620-39a28430e975", "domain": ".qwen.ai", "path": "/", "secure": false, "httpOnly": false, "sameSite": null, "expirationDate": 1819859893.289},
+    {"name": "isg", "value": "BJeXssTysYOXyzULWpZe2P5XJQnh3Gs-wzMD5enEpGbNGLFa-KyCj20qfGa360O2", "domain": ".qwen.ai", "path": "/", "secure": true, "httpOnly": false, "sameSite": "no_restriction", "expirationDate": 1801121832},
+    {"name": "ssxmod_itna2", "value": "1-eqGxBD9DuQwxgDfxe9BxQk4KqYweW90eGHDyZxYK0CDmxjKidCDUAQM0ttDCwrWe_5K7lGie1YKxAErDAOyUIwine03CKAASuADBkDvLFanjkmfqtLirHLGLfGTH6MGuzDl6YS4qXj6jxuOZP98lciaRiG15U7sY0YQNmBkK4wxWUB8tPP5wjB4H10F1/PC78xm=ZnYsS3xtETNVemx=Pe4qlftX3D", "domain": ".qwen.ai", "path": "/", "secure": false, "httpOnly": false, "sameSite": null, "expirationDate": 1785571646},
+    {"name": "sca", "value": "105448c8", "domain": ".qwen.ai", "path": "/", "secure": false, "httpOnly": false, "sameSite": null, "session": true},
+    {"name": "qwen-theme", "value": "light", "domain": "chat.qwen.ai", "path": "/", "secure": false, "httpOnly": false, "sameSite": null, "expirationDate": 1817105832.703},
+    {"name": "acw_tc", "value": "0a03e59317855697678687543e2389dc1a6c1d3fe88fb2ebbd58aba84e6460", "domain": "chat.qwen.ai", "path": "/", "secure": false, "httpOnly": true, "sameSite": null, "expirationDate": 1785571567.538},
+    {"name": "aui", "value": "de1025e8-fe25-42f6-8620-39a28430e975", "domain": ".qwen.ai", "path": "/", "secure": false, "httpOnly": false, "sameSite": null, "expirationDate": 1820129827.577},
+    {"name": "cna", "value": "ZHHwItlEGF0CAdXmXDUgpQyv", "domain": ".qwen.ai", "path": "/", "secure": false, "httpOnly": false, "sameSite": null, "expirationDate": 1819859893.284},
+    {"name": "qwen-locale", "value": "en-US", "domain": "chat.qwen.ai", "path": "/", "secure": false, "httpOnly": false, "sameSite": null, "expirationDate": 1817105832.857},
+    {"name": "ssxmod_itna", "value": "1-eqGxBD9DuQwxgDfxe9BxQk4KqYweW90eGHDyZxYK0CDmxjKidCDUAQM0ttDCwrWe_5K7lGie1YKPxDsqt/xGk0DWPGEKxTxx4SDS15uxC9Z70YPNijnGx4drLKD=C74OEknMFkGuM53F8U/CwLmDGoDbq3DfqDlDDmoDitD8qDMQ0QqKxGG7rRADB65xDPDA4GIDYp5rY44DGp5qaR5axr3reD9ICoD_82onawiEmRrBYUpbzmeOeRoXQurB3QKGYt4WDhBKoMY9OUY/LktAqxRBDhPnhS9g4a1BDOywkGmKOTtYlU/gbh1AtwGDqiKXEwzlwG7GBeee7I2pIBe0YQXw0h=pXxnePniDfUsC5j7KU0p5QbyrDxD", "domain": ".qwen.ai", "path": "/", "secure": false, "httpOnly": false, "sameSite": null, "expirationDate": 1785571646},
+    {"name": "x-ap", "value": "ap-southeast-1", "domain": "chat.qwen.ai", "path": "/", "secure": false, "httpOnly": false, "sameSite": "lax", "session": true}
+]

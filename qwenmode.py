@@ -151,6 +151,80 @@ async def _dismiss_modal(page: Page) -> bool:
         return False
 
 
+async def _select_model(page: Page, model: str) -> bool:
+    """Select the given model in Qwen Studio's model dropdown.
+
+    Live-verified selectors (Aug 2026):
+      - trigger: SPAN.ant-dropdown-trigger / .index-module__model-selector___rdCim
+      - item:    DIV.index-module__model-item-name___X8Hec (text = model name)
+      - click:   .index-module__model-item___MkLlj (parent of the name)
+
+    IMPORTANT: must use real Playwright (trusted) clicks — React/antd
+    dropdowns ignore synthetic element.click() from evaluate().
+    Returns True if the trigger text matches the requested model.
+    """
+    if not model:
+        return True
+    # The model selector DIV is the reliable trigger. .ant-dropdown-trigger
+    # matches 4 elements (help "?" is first!) — never use it as .first.
+    trigger_sel = '.index-module__model-selector___rdCim'
+    for attempt in range(3):
+        try:
+            # 1. Close any guidance/onboarding popup that blocks the dropdown
+            try:
+                g = page.locator('.guidance-pc-close-btn').first
+                if await g.count() > 0 and await g.is_visible():
+                    await g.click(timeout=2000, force=True)
+                    await asyncio.sleep(0.8)
+            except Exception:
+                pass
+
+            # 2. Read current selection from trigger
+            trigger = page.locator(trigger_sel).first
+            if await trigger.count() > 0:
+                cur = (await trigger.inner_text(timeout=2000)).strip()
+                if cur == model:
+                    return True
+
+            # 3. Open dropdown with a real click
+            try:
+                await trigger.click(timeout=3000, force=True)
+            except Exception:
+                # Fallback: header element containing the current model text
+                try:
+                    await page.locator(f'text={model}').first.click(timeout=3000, force=True)
+                except Exception:
+                    pass
+
+            # 4. Wait for dropdown items to render, then click the target item
+            await asyncio.sleep(0.8)
+            item = page.locator(
+                f'.index-module__model-item-name___X8Hec:has-text("{model}")'
+            ).first
+            if await item.count() > 0:
+                try:
+                    await item.click(timeout=3000, force=True)
+                except Exception:
+                    # Click the clickable wrapper if the name itself is inert
+                    wrapper = page.locator(
+                        f'.index-module__model-item___MkLlj:has-text("{model}")'
+                    ).first
+                    if await wrapper.count() > 0:
+                        await wrapper.click(timeout=3000, force=True)
+
+            # 5. Verify selection took effect
+            await asyncio.sleep(0.8)
+            trigger = page.locator(trigger_sel).first
+            if await trigger.count() > 0:
+                cur = (await trigger.inner_text(timeout=2000)).strip()
+                if cur == model:
+                    return True
+        except Exception as e:
+            log.debug(f"_select_model attempt {attempt} failed: {e}")
+            await asyncio.sleep(0.5)
+    return False
+
+
 async def _create_page(ctx: BrowserContext, model: str) -> Page:
     """Create and initialize a new page."""
     page = await ctx.new_page()
@@ -166,6 +240,10 @@ async def _create_page(ctx: BrowserContext, model: str) -> Page:
             if ta:
                 break
             await asyncio.sleep(0.5)
+        # Select the requested model (no-op if already default)
+        selected = await _select_model(page, model)
+        if not selected:
+            log.warning(f"Model selection failed for '{model}' — continuing with default")
         return page
     except Exception:
         try:
@@ -382,6 +460,7 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) 
                     capture_ts[0] = now
                     bodies["raw"] = raw
                     response_event.set()
+                    log.info(f"SSE captured: {len(raw)} bytes, head: {raw[:200]!r}")
             except Exception:
                 pass
 
@@ -844,6 +923,11 @@ class QwenModePool:
         log.info(f"Rotated cookies: #{old} -> #{self._cookie_idx} ({total} sets)")
 
     async def start(self) -> None:
+        # NOTE: We do NOT wipe the profile in guest mode. Qwen blocks FRESH
+        # guest sessions ("log in or sign up" modal on every send) but allows
+        # STABLE guest sessions that carry cookies from previous visits —
+        # exactly like a normal browser vs incognito. Persistent profile =
+        # the guest session accumulates trust and sending works.
         self.playwright = await async_playwright().start()
         self.ctx = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
@@ -865,6 +949,25 @@ class QwenModePool:
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
             Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU', 'en']});
+            // CRITICAL FIX (Aug 2026): Qwen Studio's incognito detector
+            // (detect-incognito lib) flags headless Chromium as private mode:
+            // in-memory IndexedDB makes strict/relaxed durability writes take
+            // the same time (ratio < 1.3) -> isPrivate=true ->
+            // isDisableGuestAccess=true -> "Log in or sign up" modal on EVERY
+            // send. Force transaction durability to 'relaxed' so the
+            // detector's strict check fails -> isPrivate=false -> guest OK.
+            (() => {
+                try {
+                    const origTx = IDBDatabase.prototype.transaction;
+                    IDBDatabase.prototype.transaction = function(...args) {
+                        const tx = origTx.apply(this, args);
+                        try {
+                            Object.defineProperty(tx, 'durability', { value: 'relaxed', configurable: true });
+                        } catch (e) {}
+                        return tx;
+                    };
+                } catch (e) {}
+            })();
         """)
 
         for i in range(self.size):
@@ -1003,6 +1106,14 @@ class QwenModePool:
                             log.warning(f"Page {idx} hit rate limit: {text[:100]}")
                             if not GUEST_MODE:
                                 self._rotate_cookies()
+                            else:
+                                # Guest mode: wipe cookies so the recreated page
+                                # gets a fresh guest session (old one is spent)
+                                try:
+                                    await self.ctx.clear_cookies()
+                                    log.info("Guest mode: cleared cookies on limit hit")
+                                except Exception as e:
+                                    log.warning(f"Guest mode: clear_cookies failed: {e}")
                             # Recreate page with new cookies
                             async with self._lock:
                                 await self._recreate_page_with_cookies(idx)
@@ -1089,6 +1200,7 @@ class QwenModePool:
 
     async def chat(self, messages: list[dict], tools: Optional[list] = None) -> dict:
         last_content = _build_prompt(messages)
+        log.info(f"CHAT: messages={len(messages)}, prompt_chars={len(last_content)}, tools={len(tools) if tools else 0}")
         if not last_content:
             return {"role": "assistant", "content": "[QwenMode] No message"}
 
@@ -1178,6 +1290,10 @@ def run_server(port: int = 5002) -> None:
 
         result = await pool.chat(req.messages, tools=req.tools)
 
+        # Report the model actually used (what's selected in the browser),
+        # not whatever the client happened to request.
+        real_model = pool.model
+
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
         content = result.get("content", "")
@@ -1195,7 +1311,7 @@ def run_server(port: int = 5002) -> None:
                 "id": cid,
                 "object": "chat.completion",
                 "created": created,
-                "model": req.model,
+                "model": real_model,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}]
             }
 
@@ -1219,24 +1335,24 @@ def run_server(port: int = 5002) -> None:
                         },
                     })
                 if reasoning:
-                    yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": req.model, "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": reasoning}, "finish_reason": None}]})}\n\n'
-                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": req.model, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tc_deltas}, "finish_reason": None}]})}\n\n'
-                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": req.model, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})}\n\n'
+                    yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": reasoning}, "finish_reason": None}]})}\n\n'
+                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tc_deltas}, "finish_reason": None}]})}\n\n'
+                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})}\n\n'
                 yield "data: [DONE]\n\n"
                 return
 
             if reasoning:
-                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": req.model, "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": reasoning}, "finish_reason": None}]})}\n\n'
+                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": reasoning}, "finish_reason": None}]})}\n\n'
 
             if content:
                 # Stream content word by word for better UX
                 words = content.split(" ")
                 for i in range(0, len(words), 5):
                     chunk = " ".join(words[i:i+5])
-                    yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": req.model, "choices": [{"index": 0, "delta": {"content": chunk + " "}, "finish_reason": None}]})}\n\n'
+                    yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"content": chunk + " "}, "finish_reason": None}]})}\n\n'
                     await asyncio.sleep(0.01)
 
-            yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": req.model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})}\n\n'
+            yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})}\n\n'
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(gen(), media_type="text/event-stream")
