@@ -12,6 +12,7 @@ import re
 import hashlib
 import logging
 import os
+import shutil
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional, Any
@@ -19,7 +20,7 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 
 # ─── Configuration ──────────────────────────────────────────────────────────
 URL = os.getenv("QWENMODE_URL", "https://chat.qwen.ai")
-POOL_SIZE = int(os.getenv("QWENMODE_POOL_SIZE", "1"))
+POOL_SIZE = int(os.getenv("QWENMODE_POOL_SIZE", "2"))
 SSE_TIMEOUT = int(os.getenv("QWENMODE_SSE_TIMEOUT", "90"))
 MAX_ATTEMPTS = int(os.getenv("QWENMODE_MAX_ATTEMPTS", "2"))
 CREATE_PAGE_DELAY = float(os.getenv("QWENMODE_CREATE_PAGE_DELAY", "3.0"))
@@ -513,19 +514,41 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) 
         except Exception:
             pass
 
-        # Send loop — press Enter, dismiss login modal if it appears, retry
+        # Send loop — press Enter, dismiss login modal if it appears, retry.
+        # After clicking send, verify the message actually LEFT the textarea
+        # (Qwen clears it on successful send). If it's still there after a
+        # few seconds, the click was swallowed (modal/overlay) — re-send.
         for send_attempt in range(3):
             response_event.clear()
             await _click_send(page)
 
-            # Wait for SSE — Qwen3.8 has thinking phase that takes 5-10s
-            try:
-                await asyncio.wait_for(response_event.wait(), timeout=10.0)
-                break  # Got SSE!
-            except asyncio.TimeoutError:
-                pass
+            # Wait for EITHER SSE arrival OR textarea clearing (send OK)
+            sent_ok = False
+            for _ in range(32):  # up to 8s
+                if response_event.is_set():
+                    sent_ok = True
+                    break
+                try:
+                    cur = await page.evaluate("() => document.querySelector('textarea')?.value || ''")
+                    if len(cur.strip()) < max(5, int(len(prompt.strip()) * 0.15)):
+                        sent_ok = True
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.25)
 
-            # No SSE yet — check if a login modal appeared and dismiss it
+            if response_event.is_set():
+                break  # Got SSE!
+
+            if sent_ok:
+                # Message went out — wait the remainder for SSE
+                try:
+                    await asyncio.wait_for(response_event.wait(), timeout=max(1, timeout - 8))
+                except asyncio.TimeoutError:
+                    pass
+                break
+
+            # Text still in textarea — send was swallowed. Check for modal.
             modal_dismissed = False
             try:
                 ad = await _dismiss_auth_dialog(page)
@@ -545,12 +568,11 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) 
                     await _type_text(page, prompt)
                 continue  # Modal was blocking — retry
 
-            # No modal, no SSE yet — wait the remainder
-            try:
-                await asyncio.wait_for(response_event.wait(), timeout=max(1, timeout - 3))
-            except asyncio.TimeoutError:
-                pass
-            break
+            # No modal, no SSE, text still there — force re-type and re-send
+            log.warning(f"Send attempt {send_attempt}: textarea not cleared, re-typing")
+            await _type_text(page, prompt)
+            await asyncio.sleep(1)
+            continue
 
         if bodies["raw"] is not None:
             parsed = _parse_qwen_sse(bodies["raw"])
@@ -1050,14 +1072,9 @@ class QwenModePool:
         self._cookie_idx = (self._cookie_idx + 1) % total
         log.info(f"Rotated cookies: #{old} -> #{self._cookie_idx} ({total} sets)")
 
-    async def start(self) -> None:
-        # NOTE: We do NOT wipe the profile in guest mode. Qwen blocks FRESH
-        # guest sessions ("log in or sign up" modal on every send) but allows
-        # STABLE guest sessions that carry cookies from previous visits —
-        # exactly like a normal browser vs incognito. Persistent profile =
-        # the guest session accumulates trust and sending works.
-        self.playwright = await async_playwright().start()
-        self.ctx = await self.playwright.chromium.launch_persistent_context(
+    async def _launch_context(self) -> BrowserContext:
+        """Launch a fresh persistent context (brand-new guest session)."""
+        ctx = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
             headless=self.headless,
             args=_LAUNCH_ARGS,
@@ -1067,18 +1084,11 @@ class QwenModePool:
             locale="ru-RU",
             timezone_id="Europe/Helsinki",
         )
+        await self._install_init_script(ctx)
+        return ctx
 
-        # Load cookie pool. IMPORTANT: in guest mode do NOT apply cookie files
-        # from cookies/*.json — those are exports of an OLD session (possibly
-        # already daily-limited). The persistent profile itself accumulates
-        # fresh guest cookies naturally on each visit; applying stale exports
-        # re-binds us to the burned session and resurrects "upper limit for
-        # today's usage". Only the non-guest (account) mode uses cookie files.
-        if not GUEST_MODE:
-            self._scan_cookies()
-            await self._apply_cookies()
-
-        await self.ctx.add_init_script("""
+    async def _install_init_script(self, ctx: BrowserContext) -> None:
+        await ctx.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
             Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU', 'en']});
@@ -1102,6 +1112,25 @@ class QwenModePool:
                 } catch (e) {}
             })();
         """)
+
+    async def start(self) -> None:
+        # NOTE: We do NOT wipe the profile in guest mode. Qwen blocks FRESH
+        # guest sessions ("log in or sign up" modal on every send) but allows
+        # STABLE guest sessions that carry cookies from previous visits —
+        # exactly like a normal browser vs incognito. Persistent profile =
+        # the guest session accumulates trust and sending works.
+        self.playwright = await async_playwright().start()
+        self.ctx = await self._launch_context()
+
+        # Load cookie pool. IMPORTANT: in guest mode do NOT apply cookie files
+        # from cookies/*.json — those are exports of an OLD session (possibly
+        # already daily-limited). The persistent profile itself accumulates
+        # fresh guest cookies naturally on each visit; applying stale exports
+        # re-binds us to the burned session and resurrects "upper limit for
+        # today's usage". Only the non-guest (account) mode uses cookie files.
+        if not GUEST_MODE:
+            self._scan_cookies()
+            await self._apply_cookies()
 
         for i in range(self.size):
             for attempt in range(5):
@@ -1170,6 +1199,50 @@ class QwenModePool:
         except Exception as e:
             log.error(f"Page {idx} recreate failed: {e}")
             self._states[idx] = None
+
+    async def _recreate_profile(self, idx: int) -> None:
+        """Nuke the whole persistent profile and relaunch — a BRAND-NEW guest session.
+
+        Called when the current guest session is burned (daily "upper limit").
+        Recreating pages inside the same profile does NOT reset the limit —
+        the burned session cookies persist. Only a fresh profile (fresh
+        cookies) restores unlimited guest usage.
+        """
+        old = self._states[idx]
+        if old:
+            try:
+                await old.page.close()
+            except Exception:
+                pass
+        # Close the entire browser context (releases profile lock on disk)
+        if self.ctx:
+            try:
+                await self.ctx.close()
+            except Exception as e:
+                log.warning(f"Profile close failed: {e}")
+        # Wipe the profile dir — fresh guest cookies on next launch
+        for attempt in range(3):
+            try:
+                shutil.rmtree(USER_DATA_DIR, ignore_errors=True)
+                self.ctx = await self._launch_context()
+                if not GUEST_MODE:
+                    await self._apply_cookies()
+                # Recreate ALL pages (the old context hosted them all)
+                for i in range(self.size):
+                    try:
+                        page = await _create_page(self.ctx, self.model)
+                        self._states[i] = PageState(page=page)
+                    except Exception as e:
+                        log.warning(f"Profile recreate: page {i} failed: {e}")
+                        self._states[i] = None
+                if self._states[idx] is not None:
+                    log.info(f"Profile {idx} recreated — fresh guest session (dir wiped)")
+                    return
+            except Exception as e:
+                log.warning(f"Profile recreate attempt {attempt+1} failed: {e}")
+                await asyncio.sleep(5)
+        self._states[idx] = None
+        log.error(f"Profile {idx} recreate FAILED after 3 attempts")
 
     async def _heartbeat(self) -> None:
         while not self._shutdown:
@@ -1251,6 +1324,7 @@ class QwenModePool:
 
             try:
                 result = None
+                last_error_text = ""
                 for attempt in range(4):
                     res, new_page = await _wait_for_response(
                         state.page, prompt, self.model, SSE_TIMEOUT
@@ -1258,69 +1332,90 @@ class QwenModePool:
                     text = res.get("text", "")
                     log.info(f"EXEC attempt={attempt} text_head={text[:120]!r}")
                     if text.startswith("[Qwen Error]"):
-                        # "high demand" / quota_limit = temporary per-minute rate
-                        # limit. Back off briefly and retry in the SAME session —
-                        # do NOT burn cookies (guest session trust is precious).
-                        if "high demand" in text.lower() or "quota" in text.lower() or "limit" in text.lower() or "usage" in text.lower():
-                            log.warning(f"Page {idx} hit rate limit: {text[:120]}")
-                            if "high demand" in text.lower() or "quota" in text.lower():
-                                # Temporary throttle — wait and retry same page
-                                backoff = 15 + attempt * 20
-                                log.info(f"Guest mode: throttled, backing off {backoff}s and retrying same page")
-                                await asyncio.sleep(backoff)
-                                # Fresh chat page keeps the session alive
-                                try:
-                                    await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
-                                    await asyncio.sleep(2)
-                                    await _dismiss_auth_dialog(state.page)
-                                    await _dismiss_modal(state.page)
-                                    for _ in range(15):
-                                        ta = await state.page.query_selector('textarea')
-                                        if ta:
-                                            break
-                                        await asyncio.sleep(0.5)
-                                except Exception as e:
-                                    log.warning(f"Page {idx} refresh failed on throttle retry: {e}")
-                                continue  # Retry same page after backoff
-                            if not GUEST_MODE:
-                                self._rotate_cookies()
-                            else:
-                                # Guest mode: DO NOT clear cookies here. The
-                                # persistent profile IS the guest session's
-                                # trust — wiping it makes Qwen treat us as a
-                                # brand-new incognito visitor and it slams the
-                                # daily-limit / login-modal wall even harder.
-                                # Just recreate the page in the same session.
-                                log.info("Guest mode: keeping cookies, recreating page only")
-                            # Recreate page with new cookies
+                        last_error_text = text
+                        low = text.lower()
+                        # ── DAILY limit (guest session burned) ───────────────
+                        # "upper limit for today's usage" / RateLimited. This is
+                        # NOT a temporary throttle: the current guest session is
+                        # burned. Recreating pages inside the same profile is
+                        # useless (same cookies). Must wipe the profile and
+                        # start a BRAND-NEW guest session.
+                        if "upper limit" in low or "ratelimited" in low:
+                            log.warning(f"Page {idx} DAILY limit: {text[:120]} — recreating guest profile")
                             async with self._lock:
-                                await self._recreate_page_with_cookies(idx)
+                                await self._recreate_profile(idx)
                                 new_state = self._states[idx]
                                 if new_state is None:
-                                    return {"text": "[QwenMode] Page unavailable after rotate", "reasoning": ""}
+                                    return {"text": "[QwenMode] Guest session recreate failed — daily limit", "reasoning": ""}
                                 new_state.busy = True
                                 state = new_state
-                            continue  # Retry with new page
-                        if attempt == 0:
-                            log.info(f"Page {idx} got Qwen error: {text[:200]}, refreshing and retry")
+                            # Cooldown so the fresh session isn't slammed instantly
+                            await asyncio.sleep(20 + attempt * 10)
+                            continue
+                        # ── Temporary throttle (high demand / quota_limit) ───
+                        if "high demand" in low or "quota" in low:
+                            backoff = 20 + attempt * 25
+                            log.info(f"Page {idx} throttled (quota/high demand), backing off {backoff}s")
+                            await asyncio.sleep(backoff)
                             try:
                                 await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
                                 await asyncio.sleep(2)
                                 await _dismiss_auth_dialog(state.page)
                                 await _dismiss_modal(state.page)
+                                await _select_model(state.page, self.model)
                                 for _ in range(15):
                                     ta = await state.page.query_selector('textarea')
                                     if ta:
                                         break
                                     await asyncio.sleep(0.5)
                             except Exception as e:
-                                log.warning(f"Page {idx} refresh failed on retry: {e}")
+                                log.warning(f"Page {idx} refresh failed on throttle retry: {e}")
+                            continue  # Retry same page after backoff
+                        # ── Other Qwen errors (limit/usage wording) ──────────
+                        if not GUEST_MODE:
+                            self._rotate_cookies()
+                        else:
+                            # Guest mode: unknown limit wording — safest is a
+                            # fresh guest session (burned cookies are useless).
+                            log.info(f"Guest mode: rotating profile for {text[:80]}")
+                            async with self._lock:
+                                await self._recreate_profile(idx)
+                                new_state = self._states[idx]
+                                if new_state is None:
+                                    return {"text": "[QwenMode] Guest session recreate failed", "reasoning": ""}
+                                new_state.busy = True
+                                state = new_state
+                            await asyncio.sleep(15)
+                            continue
+                    elif not text.strip():
+                        # ── EMPTY response ───────────────────────────────────
+                        # Qwen returned nothing (SSE missed / DOM empty / send
+                        # swallowed). NEVER return empty to the client: refresh
+                        # and resend. Escalate on later attempts.
+                        log.warning(f"Page {idx} EMPTY response (attempt {attempt}) — refreshing and retrying")
+                        last_error_text = "[QwenMode] Empty response"
+                        if attempt < 3:
+                            try:
+                                await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+                                await asyncio.sleep(2 + attempt * 3)
+                                await _dismiss_auth_dialog(state.page)
+                                await _dismiss_modal(state.page)
+                                await _select_model(state.page, self.model)
+                                for _ in range(15):
+                                    ta = await state.page.query_selector('textarea')
+                                    if ta:
+                                        break
+                                    await asyncio.sleep(0.5)
+                            except Exception as e:
+                                log.warning(f"Page {idx} refresh failed on empty retry: {e}")
                             continue
                     result = (res, new_page)
                     break
 
                 if result is None:
-                    result = (res, new_page)  # Use last attempt anyway
+                    # All 4 attempts failed with an error/empty — return the
+                    # last error text explicitly, NEVER a blank string.
+                    result = ({"text": last_error_text or "[QwenMode] No response after 4 attempts", "reasoning": ""}, state.page)
                 result, new_page = result
 
                 async with self._lock:
