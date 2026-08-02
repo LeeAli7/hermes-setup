@@ -834,6 +834,11 @@ def _build_tool_block(tools: list[dict]) -> str:
         '{"tool": "tool1", "arguments": {...}}',
         '{"tool": "tool2", "arguments": {...}}',
         "",
+        "CRITICAL: The JSON you output is parsed by a machine. When the content",
+        "contains quotes (HTML/CSS/JS files, code), ESCAPE every double quote",
+        'inside strings as \\" — e.g. lang=\\"ru\\", not lang="ru". Unescaped',
+        "quotes corrupt the JSON and your tool call will be ignored.",
+        "",
         "NO additional text, NO markdown, NO explanation around tool calls.",
     ])
     return "\n".join(desc_lines)
@@ -845,6 +850,108 @@ def _build_tool_prompt(last_content: str, tools: list[dict]) -> str:
 
 
 # ─── Tool Call Parsing ──────────────────────────────────────────────────────
+def _repair_json(s: str) -> Optional[dict]:
+    """Parse a JSON object, tolerating unescaped quotes inside string values.
+
+    Qwen frequently emits file contents (HTML/CSS/JS) with raw double quotes
+    like lang="ru" inside a JSON string — that is invalid JSON and
+    json.loads() throws. We try progressively:
+      1. plain json.loads
+      2. heuristic re-escaping of inner quotes
+      3. manual rebuild for the known tool-call shapes
+    Returns the parsed dict or None.
+    """
+    # 1. Plain
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # 2. Heuristic escape: a quote closes a string when the next non-space
+    #    char is , } ] : or end; otherwise it's an inner quote -> escape it.
+    out = []
+    in_str = False
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            out.append(c)
+            out.append(s[i + 1])
+            i += 2
+            continue
+        if c == '"':
+            nxt = ""
+            j = i + 1
+            while j < n and s[j] in " \t\r\n":
+                j += 1
+            if j < n:
+                nxt = s[j]
+            if in_str:
+                if nxt in ",}]:":
+                    in_str = False
+                    out.append(c)
+                else:
+                    out.append('\\"')
+            else:
+                prev = s[i - 1] if i > 0 else ""
+                if prev in "{[,:" or nxt in "}],:" or i == 0:
+                    in_str = True
+                    out.append(c)
+                else:
+                    out.append('\\"')
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    repaired = "".join(out)
+    try:
+        return json.loads(repaired)
+    except Exception:
+        pass
+
+    # 3. Manual rebuild for known shapes (write/read/edit/bash...)
+    try:
+        m = re.search(r'"tool"\s*:\s*"([^"]+)"', s)
+        if not m:
+            return None
+        name = m.group(1).strip()
+        if "." in name or "/" in name:
+            name = re.split(r"[./]", name)[-1]
+        args: dict = {}
+        # simple string args first (path, command, filePath...)
+        for key in ("path", "filePath", "command", "oldString", "newString"):
+            mk = re.search(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)"' % key, s)
+            if mk:
+                args[key] = mk.group(1).replace('\\"', '"').replace("\\\\", "\\")
+        # content: greedy to the final closing of the arguments object
+        mc = re.search(r'"content"\s*:\s*"(.*)', s, re.DOTALL)
+        if mc:
+            rest = mc.group(1)
+            # strip trailing `"}` / `", "` / `"}`
+            idx = rest.rfind('"}')
+            if idx != -1:
+                content = rest[:idx]
+            else:
+                content = rest
+            # unescape what we can
+            content = content.replace('\\"', '"').replace("\\\\", "\\")
+            args["content"] = content
+        if name == "edit" and "path" in args:
+            # keep edits if present and parseable
+            me = re.search(r'"edits"\s*:\s*(\[.*)', s, re.DOTALL)
+            if me:
+                try:
+                    args["edits"] = json.loads(me.group(1))
+                except Exception:
+                    pass
+        if not args and name != "write":
+            return None
+        return {"tool": name, "arguments": args}
+    except Exception:
+        return None
+
+
 def _extract_all_tool_calls(text: str) -> list[tuple[str, dict]]:
     """Extract ALL tool call JSON objects from text, tolerating sloppy formats.
 
@@ -954,7 +1061,9 @@ def _extract_all_tool_calls(text: str) -> list[tuple[str, dict]]:
                 try:
                     _parse_obj(json.loads(chunk))
                 except Exception:
-                    pass
+                    obj = _repair_json(chunk)
+                    if obj is not None:
+                        _parse_obj(obj)
 
     # 2. Fallback: fenced code blocks (whole object or array)
     if not results:
@@ -962,12 +1071,21 @@ def _extract_all_tool_calls(text: str) -> list[tuple[str, dict]]:
             try:
                 obj = json.loads(m.group(1))
             except Exception:
+                obj = _repair_json(m.group(1))
+            if obj is None:
                 continue
             if isinstance(obj, list):
                 for item in obj:
                     _parse_obj(item)
             else:
                 _parse_obj(obj)
+
+    # 3. Last resort: the whole text may BE one tool-call object with broken
+    #    quoting (e.g. write with a big HTML file) — repair it as a whole.
+    if not results:
+        obj = _repair_json(text)
+        if obj is not None:
+            _parse_obj(obj)
     return results
 
 
