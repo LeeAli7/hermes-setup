@@ -22,6 +22,11 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 URL = os.getenv("QWENMODE_URL", "https://chat.qwen.ai")
 POOL_SIZE = int(os.getenv("QWENMODE_POOL_SIZE", "2"))
 SSE_TIMEOUT = int(os.getenv("QWENMODE_SSE_TIMEOUT", "90"))
+# Activity-based waiting: the fixed SSE_TIMEOUT only applies when the model
+# is SILENT. As long as new tokens keep arriving (SSE observed / DOM grows),
+# the wait extends up to SSE_MAX_WAIT. SSE_ACTIVITY_IDLE = silence budget.
+SSE_ACTIVITY_IDLE = float(os.getenv("QWENMODE_SSE_ACTIVITY_IDLE", "40"))
+SSE_MAX_WAIT = float(os.getenv("QWENMODE_SSE_MAX_WAIT", "300"))
 MAX_ATTEMPTS = int(os.getenv("QWENMODE_MAX_ATTEMPTS", "2"))
 CREATE_PAGE_DELAY = float(os.getenv("QWENMODE_CREATE_PAGE_DELAY", "3.0"))
 USER_DATA_DIR = os.getenv("QWENMODE_USER_DATA_DIR", "/tmp/qwenmode_profile")
@@ -482,22 +487,32 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) 
     bodies: dict[str, Optional[str]] = {"raw": None}
     response_event = asyncio.Event()
     capture_ts = [0.0]  # track latest capture timestamp
+    progress_ts = [time.time()]  # last observed activity (SSE start/end, DOM growth)
 
     async def capture(resp) -> None:
         if _SSE_URL_PATTERN in resp.url and bodies["raw"] is None:
             try:
-                raw = await asyncio.wait_for(resp.text(), timeout=timeout)
+                # Generous cap: a long reasoning+answer SSE can run minutes.
+                raw = await asyncio.wait_for(resp.text(), timeout=max(300, timeout * 3))
                 now = time.time()
                 # Only accept if this is the latest response (stale check)
                 if now > capture_ts[0]:
                     capture_ts[0] = now
                     bodies["raw"] = raw
+                    progress_ts[0] = now  # activity: SSE fully arrived
                     response_event.set()
                     log.info(f"SSE captured: {len(raw)} bytes, head: {raw[:200]!r}")
             except Exception:
                 pass
 
+    def on_request(req) -> None:
+        # SSE stream STARTED = the model accepted the message. This resets
+        # the silence timer even before tokens hit the DOM (long thinking).
+        if _SSE_URL_PATTERN in req.url and req.method == "POST":
+            progress_ts[0] = time.time()
+
     page.on("response", capture)
+    page.on("request", on_request)
 
     try:
         await _dismiss_auth_dialog(page)
@@ -541,11 +556,49 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) 
                 break  # Got SSE!
 
             if sent_ok:
-                # Message went out — wait the remainder for SSE
+                # Message went out — wait for SSE with an ACTIVITY timeout:
+                # as long as new tokens keep arriving (SSE observed, DOM
+                # growing), keep waiting — Qwen thinking can exceed the fixed
+                # SSE_TIMEOUT and we must NOT kill a live generation. Only
+                # give up after SSE_ACTIVITY_IDLE seconds of total silence
+                # past the base timeout, or the SSE_MAX_WAIT absolute cap.
+                start_wait = time.time()
+                poller_stop = asyncio.Event()
+
+                async def _dom_progress() -> None:
+                    last = ""
+                    while not poller_stop.is_set():
+                        try:
+                            txt = await asyncio.wait_for(
+                                _read_chat_from_dom(page, prompt), timeout=4
+                            )
+                            if txt and txt != last:
+                                last = txt
+                                progress_ts[0] = time.time()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1.5)
+
+                poller = asyncio.create_task(_dom_progress())
                 try:
-                    await asyncio.wait_for(response_event.wait(), timeout=max(1, timeout - 8))
-                except asyncio.TimeoutError:
-                    pass
+                    while True:
+                        if response_event.is_set():
+                            break
+                        now = time.time()
+                        if now - start_wait > SSE_MAX_WAIT:
+                            log.info(f"MAX_WAIT {SSE_MAX_WAIT}s exceeded, giving up")
+                            break
+                        if now - start_wait > timeout and now - progress_ts[0] > SSE_ACTIVITY_IDLE:
+                            log.info(f"Silent for {SSE_ACTIVITY_IDLE}s past {timeout}s base timeout, giving up")
+                            break
+                        await asyncio.sleep(1)
+                finally:
+                    poller_stop.set()
+                    poller.cancel()
+                    try:
+                        await poller
+                    except (asyncio.CancelledError, Exception):
+                        pass
                 break
 
             # Text still in textarea — send was swallowed. Check for modal.
@@ -608,6 +661,10 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) 
             page.remove_listener("response", capture)
         except Exception:
             pass
+        try:
+            page.remove_listener("request", on_request)
+        except Exception:
+            pass
 
 
 # ─── Prompt Building ────────────────────────────────────────────────────────
@@ -647,7 +704,9 @@ def _build_prompt(messages: list[dict]) -> str:
             if tc:
                 for t in tc:
                     fn = t.get("function", {})
-                    parts.append(f'{{"tool": "{fn.get("name", "")}", "arguments": {fn.get("arguments", "{}")}}}')
+                    # Explicit marker so Qwen understands this JSON is the
+                    # model's OWN previous tool call, not a format example.
+                    parts.append(f'[Assistant tool call]\n{{"tool": "{fn.get("name", "")}", "arguments": {fn.get("arguments", "{}")}}}')
             elif isinstance(content, list):
                 texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
                 text = "\n".join(texts)
@@ -745,62 +804,128 @@ def _build_tool_prompt(last_content: str, tools: list[dict]) -> str:
 
 # ─── Tool Call Parsing ──────────────────────────────────────────────────────
 def _extract_all_tool_calls(text: str) -> list[tuple[str, dict]]:
-    """Extract ALL tool call JSON objects from text."""
-    results: list[tuple[str, dict]] = []
+    """Extract ALL tool call JSON objects from text, tolerating sloppy formats.
 
-    # 1. Find all JSON blocks with "tool" or "function" keys
-    idx = 0
-    while True:
-        tool_pos = text.find('"tool"', idx)
-        func_pos = text.find('"function"', idx)
-        if tool_pos == -1 and func_pos == -1:
-            break
-        pos = tool_pos if tool_pos != -1 and (func_pos == -1 or tool_pos < func_pos) else func_pos
-        idx = pos + 1
-        brace = text.rfind("{", 0, pos)
-        if brace == -1:
+    Handles:
+      - {"tool": "...", "arguments": {...}}          (our canonical format)
+      - {"tool": "...", "args": {...}}               (renamed args key)
+      - {"tool": "...", "params": {...}}             (renamed params key)
+      - {"tool": "...", "arguments": "{json str}"}   (arguments as JSON string)
+      - {"function": {"name": ..., "arguments": ...}} (OpenAI shape)
+      - {"name": ..., "arguments": ...}              (bare name key)
+      - {"tool_call": {"name": ..., "arguments": ...}} (wrapper shape)
+      - {"tool": {"name": ...}, ...}                 (tool as object)
+      - fenced code blocks, arrays of the above
+    Tool names are normalized: "functions.read" -> "read".
+    """
+    results: list[tuple[str, dict]] = []
+    seen: set[tuple] = set()
+
+    def _parse_obj(obj) -> None:
+        if not isinstance(obj, dict):
+            return
+        # unwrap tool_call wrapper
+        inner = obj.get("tool_call")
+        if isinstance(inner, dict):
+            obj = inner
+        fn = obj.get("function")
+        name = obj.get("tool")
+        if not isinstance(name, str):
+            name = obj.get("name")
+        if not isinstance(name, str) and isinstance(fn, dict):
+            name = fn.get("name")
+        if not isinstance(name, str) and isinstance(fn, str):
+            name = fn
+        if not isinstance(name, str):
+            # {"tool": {"name": ...}}
+            t = obj.get("tool")
+            if isinstance(t, dict):
+                name = t.get("name") or t.get("tool")
+        if not name:
+            return
+        name = str(name).strip()
+        # normalize: "functions.read" -> "read", "bash_command" kept as-is
+        if "." in name or "/" in name:
+            name = re.split(r"[./]", name)[-1]
+        if not name:
+            return
+
+        raw_args = None
+        for k in ("arguments", "args", "params", "parameters", "input", "arg"):
+            if k in obj:
+                raw_args = obj[k]
+                break
+        if raw_args is None and isinstance(fn, dict):
+            for k in ("arguments", "args", "params", "parameters", "input"):
+                if k in fn:
+                    raw_args = fn[k]
+                    break
+        args = {}
+        if isinstance(raw_args, dict):
+            args = raw_args
+        elif isinstance(raw_args, str):
+            s = raw_args.strip()
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, dict):
+                    args = parsed
+            except Exception:
+                m = re.search(r"\{.*\}", s, re.DOTALL)
+                if m:
+                    try:
+                        parsed = json.loads(m.group(0))
+                        if isinstance(parsed, dict):
+                            args = parsed
+                    except Exception:
+                        pass
+        elif isinstance(raw_args, list):
+            # some models wrap args in a single-element list
+            if len(raw_args) == 1 and isinstance(raw_args[0], dict):
+                args = raw_args[0]
+
+        key = (name, json.dumps(args, sort_keys=True))
+        if key not in seen:
+            seen.add(key)
+            results.append((name, args))
+
+    # 1. Single pass over the text with brace matching (handles nesting, strings)
+    stack: list[int] = []
+    in_str = False
+    esc = False
+    for i, c in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
             continue
-        i = brace
-        depth = 0
-        while i < len(text):
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-            if depth == 0:
-                chunk = text[brace:i+1]
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            stack.append(i)
+        elif c == "}":
+            if stack:
+                start = stack.pop()
+                chunk = text[start:i + 1]
                 try:
-                    obj = json.loads(chunk)
-                    if isinstance(obj, dict):
-                        name = obj.get("tool") or obj.get("function", {}).get("name") or obj.get("function")
-                        if name:
-                            args = obj.get("arguments", {})
-                            results.append((str(name), args))
+                    _parse_obj(json.loads(chunk))
                 except Exception:
                     pass
-                break
-            i += 1
 
-    # 2. If nothing found, try code blocks
+    # 2. Fallback: fenced code blocks (whole object or array)
     if not results:
         for m in re.finditer(r'`{3}(?:json)?\s*(\{.*?\}|\[.*?\])\s*`{3}', text, re.DOTALL):
             try:
                 obj = json.loads(m.group(1))
-                if isinstance(obj, dict):
-                    name = obj.get("tool") or obj.get("function", {}).get("name") or obj.get("function")
-                    if name:
-                        args = obj.get("arguments", {})
-                        results.append((str(name), args))
-                elif isinstance(obj, list):
-                    for item in obj:
-                        if isinstance(item, dict):
-                            name = item.get("tool") or item.get("function", {}).get("name") or item.get("function")
-                            if name:
-                                args = item.get("arguments", {})
-                                results.append((str(name), args))
             except Exception:
-                pass
-
+                continue
+            if isinstance(obj, list):
+                for item in obj:
+                    _parse_obj(item)
+            else:
+                _parse_obj(obj)
     return results
 
 
