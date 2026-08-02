@@ -482,12 +482,18 @@ async def _read_chat_from_dom(page: Page, prompt: str = "") -> str:
     }""", prompt)
 
 
-async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) -> tuple[dict, Page]:
-    """Send prompt and wait for response via SSE or DOM fallback."""
+async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int,
+                             chunk_q: Optional[asyncio.Queue] = None) -> tuple[dict, Page]:
+    """Send prompt and wait for response via SSE or DOM fallback.
+
+    If chunk_q is given, incremental text chunks are pushed into it as the
+    model generates (live streaming via the window.__qwenStream fetch hook).
+    """
     bodies: dict[str, Optional[str]] = {"raw": None}
     response_event = asyncio.Event()
     capture_ts = [0.0]  # track latest capture timestamp
     progress_ts = [time.time()]  # last observed activity (SSE start/end, DOM growth)
+    sse_started = [False]  # a POST to the SSE endpoint was observed
 
     async def capture(resp) -> None:
         if _SSE_URL_PATTERN in resp.url and bodies["raw"] is None:
@@ -509,10 +515,19 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) 
         # SSE stream STARTED = the model accepted the message. This resets
         # the silence timer even before tokens hit the DOM (long thinking).
         if _SSE_URL_PATTERN in req.url and req.method == "POST":
+            sse_started[0] = True
             progress_ts[0] = time.time()
 
     page.on("response", capture)
     page.on("request", on_request)
+
+    # Reset the fetch-hook stream buffer before sending
+    try:
+        await page.evaluate("""() => {
+            try { window.__qwenStream = ''; window.__qwenStreamDone = false; window.__qwenStreamLen = 0; } catch (e) {}
+        }""")
+    except Exception:
+        pass
 
     try:
         await _dismiss_auth_dialog(page)
@@ -567,7 +582,9 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) 
 
                 async def _dom_progress() -> None:
                     last = ""
+                    last_stream_len = 0
                     while not poller_stop.is_set():
+                        # DOM growth (rendered tokens)
                         try:
                             txt = await asyncio.wait_for(
                                 _read_chat_from_dom(page, prompt), timeout=4
@@ -577,7 +594,23 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) 
                                 progress_ts[0] = time.time()
                         except Exception:
                             pass
-                        await asyncio.sleep(1.5)
+                        # Live SSE chunks from the fetch hook -> forward to client
+                        if chunk_q is not None:
+                            try:
+                                sraw = await page.evaluate("() => window.__qwenStream || ''")
+                                if sraw:
+                                    sp = _parse_qwen_sse(sraw)
+                                    stext = sp.get("text", "")
+                                    if len(stext) > last_stream_len:
+                                        diff = stext[last_stream_len:]
+                                        last_stream_len = len(stext)
+                                        try:
+                                            chunk_q.put_nowait(diff)
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                        await asyncio.sleep(0.8)
 
                 poller = asyncio.create_task(_dom_progress())
                 try:
@@ -588,8 +621,13 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) 
                         if now - start_wait > SSE_MAX_WAIT:
                             log.info(f"MAX_WAIT {SSE_MAX_WAIT}s exceeded, giving up")
                             break
-                        if now - start_wait > timeout and now - progress_ts[0] > SSE_ACTIVITY_IDLE:
-                            log.info(f"Silent for {SSE_ACTIVITY_IDLE}s past {timeout}s base timeout, giving up")
+                        # NEVER give up while the SSE stream is still flowing:
+                        # Qwen thinks WITHOUT drawing tokens to the DOM (long
+                        # reasoning), so DOM silence does NOT mean the model is
+                        # stuck. Only the base-timeout + DOM-idle rule applies
+                        # when no SSE POST was observed at all.
+                        if not sse_started[0] and now - start_wait > timeout and now - progress_ts[0] > SSE_ACTIVITY_IDLE:
+                            log.info(f"No SSE observed, silent for {SSE_ACTIVITY_IDLE}s past {timeout}s base timeout, giving up")
                             break
                         await asyncio.sleep(1)
                 finally:
@@ -629,8 +667,12 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int) 
 
         if bodies["raw"] is not None:
             parsed = _parse_qwen_sse(bodies["raw"])
+            log.info(f"PARSED: text_len={len(parsed.get('text',''))} reasoning_len={len(parsed.get('reasoning',''))} head={parsed.get('text','')[:80]!r}")
             if not parsed.get("text") and not parsed.get("reasoning"):
                 log.warning(f"SSE parsed EMPTY: {bodies['raw'][:800]!r}")
+            elif not parsed.get("text"):
+                # Reasoning-only SSE — dump the tail where the answer should be
+                log.warning(f"SSE reasoning-only (len={len(bodies['raw'])}): TAIL {bodies['raw'][-1500:]!r}")
             # Dismiss post-response login prompt (guest mode)
             await _dismiss_auth_dialog(page)
             await _dismiss_modal(page)
@@ -1236,6 +1278,45 @@ class QwenModePool:
                     };
                 } catch (e) {}
             })();
+            // LIVE STREAMING: intercept the SSE fetch and accumulate raw
+            // chunks into window.__qwenStream so the Python side can forward
+            // tokens to the client in real time (not just at the end).
+            (() => {
+                try {
+                    const origFetch = window.fetch;
+                    window.__qwenStream = '';
+                    window.__qwenStreamDone = false;
+                    window.__qwenStreamLen = 0;
+                    window.fetch = async (...args) => {
+                        const resp = await origFetch.apply(window, args);
+                        let url = '';
+                        try {
+                            url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+                        } catch (e) {}
+                        if (url.includes('/api/v2/chat/completions') && resp && resp.body) {
+                            try {
+                                const clone = resp.clone();
+                                const reader = clone.body.getReader();
+                                const decoder = new TextDecoder();
+                                (async () => {
+                                    try {
+                                        while (true) {
+                                            const {done, value} = await reader.read();
+                                            if (done) break;
+                                            window.__qwenStream += decoder.decode(value, {stream: true});
+                                            window.__qwenStreamLen = window.__qwenStream.length;
+                                        }
+                                        window.__qwenStreamDone = true;
+                                    } catch (e) {
+                                        window.__qwenStreamDone = true;
+                                    }
+                                })();
+                            } catch (e) {}
+                        }
+                        return resp;
+                    };
+                } catch (e) {}
+            })();
         """)
 
     async def start(self) -> None:
@@ -1610,6 +1691,14 @@ class QwenModePool:
         if not last_content:
             return {"role": "assistant", "content": "[QwenMode] No message"}
 
+        prompt = self._build_request_prompt(messages, tools)
+
+        result = await self.execute(prompt, fresh=True)
+        return _format_chat_result(result.get("text", ""), result.get("reasoning", ""), tools)
+
+    def _build_request_prompt(self, messages: list[dict], tools: Optional[list]) -> str:
+        """Build the textarea prompt: context + tool block + request (see chat())."""
+        last_content = _build_prompt(messages)
         if tools:
             # Order matters: context (system + history) FIRST, then our tool
             # block, then the actual user request LAST. If the tool block is
@@ -1625,14 +1714,221 @@ class QwenModePool:
             if user_idx > 0:
                 ctx_text = _build_prompt(messages[:user_idx])
                 user_text = _build_prompt(messages[user_idx:])
-                prompt = f"{ctx_text}\n\n{_build_tool_block(tools)}\n\n{user_text}"
-            else:
-                prompt = _build_tool_prompt(last_content, tools)
-        else:
-            prompt = last_content
+                return f"{ctx_text}\n\n{_build_tool_block(tools)}\n\n{user_text}"
+            return _build_tool_prompt(last_content, tools)
+        return last_content
 
-        result = await self.execute(prompt, fresh=True)
-        return _format_chat_result(result.get("text", ""), result.get("reasoning", ""), tools)
+    async def execute_stream(self, prompt: str, fresh: bool = False):
+        """Like execute(), but YIELDS incremental text chunks as Qwen generates.
+
+        Live streaming via the window.__qwenStream fetch hook (see
+        _install_init_script). Final result (with tool_calls etc.) is not
+        streamed here — use execute() for tool-using requests; this is for
+        plain chat streaming.
+        """
+        await self._available.acquire()
+        try:
+            async with self._lock:
+                idx = -1
+                for i, state in enumerate(self._states):
+                    if state is not None and not state.busy and not state.resetting:
+                        idx = i
+                        state.busy = True
+                        state.last_used = time.time()
+                        break
+                if idx == -1:
+                    yield "[QwenMode] No available pages"
+                    return
+            state = self._states[idx]
+
+            if fresh:
+                try:
+                    cur = state.page.url
+                    if "/c/" in str(cur):
+                        log.info(f"Page {idx}: fresh session — opening new chat")
+                        await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+                        for _ in range(20):
+                            ta = await state.page.query_selector('textarea')
+                            if ta:
+                                break
+                            await asyncio.sleep(0.15)
+                        await _dismiss_auth_dialog(state.page)
+                        await _dismiss_modal(state.page)
+                        await _select_model(state.page, self.model)
+                except Exception as e:
+                    log.warning(f"Page {idx} fresh-chat nav failed: {e}")
+
+            if not await self._check_health(state.page):
+                async with self._lock:
+                    await self._recreate_page(idx)
+                    state = self._states[idx]
+                    if state is None:
+                        yield "[QwenMode] Page unavailable after recreate"
+                        return
+                    state.busy = True
+
+            chunk_q: asyncio.Queue = asyncio.Queue()
+
+            async def _attempt_loop():
+                nonlocal state
+                result = None
+                last_error_text = ""
+                for attempt in range(4):
+                    res, new_page = await _wait_for_response(
+                        state.page, prompt, self.model, SSE_TIMEOUT, chunk_q
+                    )
+                    text = res.get("text", "")
+                    log.info(f"EXEC-STREAM attempt={attempt} text_head={text[:120]!r}")
+                    if text.startswith("[Qwen Error]"):
+                        last_error_text = text
+                        low = text.lower()
+                        if "upper limit" in low or "ratelimited" in low:
+                            log.warning(f"Page {idx} DAILY limit: {text[:120]} — recreating guest profile")
+                            async with self._lock:
+                                await self._recreate_profile(idx)
+                                new_state = self._states[idx]
+                                if new_state is None:
+                                    return ({"text": "[QwenMode] Guest session recreate failed — daily limit", "reasoning": ""}, state.page)
+                                new_state.busy = True
+                            state = new_state
+                            await asyncio.sleep(20 + attempt * 10)
+                            continue
+                        if "high demand" in low or "quota" in low:
+                            backoff = 20 + attempt * 25
+                            log.info(f"Page {idx} throttled (quota/high demand), backing off {backoff}s")
+                            await asyncio.sleep(backoff)
+                            try:
+                                await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+                                await asyncio.sleep(2)
+                                await _dismiss_auth_dialog(state.page)
+                                await _dismiss_modal(state.page)
+                                await _select_model(state.page, self.model)
+                                for _ in range(15):
+                                    ta = await state.page.query_selector('textarea')
+                                    if ta:
+                                        break
+                                    await asyncio.sleep(0.5)
+                            except Exception as e:
+                                log.warning(f"Page {idx} refresh failed on throttle retry: {e}")
+                            continue
+                        log.info(f"Guest mode: rotating profile for {text[:80]}")
+                        async with self._lock:
+                            await self._recreate_profile(idx)
+                            new_state = self._states[idx]
+                            if new_state is None:
+                                return ({"text": "[QwenMode] Guest session recreate failed", "reasoning": ""}, state.page)
+                            new_state.busy = True
+                        state = new_state
+                        await asyncio.sleep(15)
+                        continue
+                    elif not text.strip():
+                        log.warning(f"Page {idx} EMPTY response (attempt {attempt}) — refreshing and retrying")
+                        last_error_text = "[QwenMode] Empty response"
+                        if attempt < 3:
+                            try:
+                                await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+                                await asyncio.sleep(2 + attempt * 3)
+                                await _dismiss_auth_dialog(state.page)
+                                await _dismiss_modal(state.page)
+                                await _select_model(state.page, self.model)
+                                for _ in range(15):
+                                    ta = await state.page.query_selector('textarea')
+                                    if ta:
+                                        break
+                                    await asyncio.sleep(0.5)
+                            except Exception as e:
+                                log.warning(f"Page {idx} refresh failed on empty retry: {e}")
+                            continue
+                    result = (res, new_page)
+                    break
+
+                if result is None:
+                    result = ({"text": last_error_text or "[QwenMode] No response after 4 attempts", "reasoning": ""}, state.page)
+                return result
+
+            task = asyncio.create_task(_attempt_loop())
+            yielded_any = False
+            while True:
+                if task.done():
+                    break
+                try:
+                    chunk = await asyncio.wait_for(chunk_q.get(), timeout=0.4)
+                    if chunk:
+                        yielded_any = True
+                        yield chunk
+                except asyncio.TimeoutError:
+                    continue
+
+            # Drain any chunks that arrived between last check and task end
+            while not chunk_q.empty():
+                try:
+                    chunk = chunk_q.get_nowait()
+                    if chunk:
+                        yielded_any = True
+                        yield chunk
+                except asyncio.QueueEmpty:
+                    break
+
+            final = task.result()
+            result, new_page = final
+
+            # If nothing was streamed (short answer, tool call, error) — emit
+            # the final text so the client always gets SOMETHING.
+            if not yielded_any:
+                txt = result.get("text", "")
+                if txt:
+                    yield txt
+
+            async with self._lock:
+                if new_page != state.page:
+                    try:
+                        await state.page.close()
+                    except Exception:
+                        pass
+                    self._states[idx] = PageState(page=new_page)
+                else:
+                    state.resetting = True
+                    state.busy = False
+
+            if new_page == state.page:
+                RESET_IDLE = 120.0
+                try:
+                    cur_url = state.page.url
+                    idle = time.time() - state.last_used
+                    needs_reset = False
+                    if idle > RESET_IDLE:
+                        needs_reset = True
+                    elif "/c/" not in str(cur_url):
+                        ta = await state.page.query_selector('textarea')
+                        if ta is None:
+                            needs_reset = True
+                    if needs_reset:
+                        await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+                        for _ in range(20):
+                            ta = await state.page.query_selector('textarea')
+                            if ta:
+                                break
+                            await asyncio.sleep(0.3)
+                        await asyncio.sleep(1)
+                        await _dismiss_auth_dialog(state.page)
+                        await _dismiss_modal(state.page)
+                except Exception as e:
+                    log.warning(f"Page {idx} reset check failed: {e}")
+                finally:
+                    state.resetting = False
+                    state.last_used = time.time()
+        finally:
+            self._available.release()
+
+    async def chat_stream(self, messages: list[dict]):
+        """Stream plain-chat responses (no tools) chunk by chunk."""
+        last_content = _build_prompt(messages)
+        if not last_content:
+            yield "[QwenMode] No message"
+            return
+        prompt = self._build_request_prompt(messages, None)
+        async for chunk in self.execute_stream(prompt, fresh=True):
+            yield chunk
 
     async def close(self) -> None:
         self._shutdown = True
@@ -1709,6 +2005,20 @@ def run_server(port: int = 5002) -> None:
 
         if pool is None:
             raise HTTPException(status_code=503, detail="Pool not ready")
+
+        # Real-time streaming for plain chats (no tools — tool_calls must be
+        # delivered atomically, so tool-using requests use the full path).
+        if req.stream and not req.tools:
+            async def gen_live():
+                cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+                created = int(time.time())
+                real_model = pool.model
+                async for chunk in pool.chat_stream(req.messages):
+                    if chunk:
+                        yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]})}\n\n'
+                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})}\n\n'
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(gen_live(), media_type="text/event-stream")
 
         result = await pool.chat(req.messages, tools=req.tools)
 
