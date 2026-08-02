@@ -26,7 +26,9 @@ SSE_TIMEOUT = int(os.getenv("QWENMODE_SSE_TIMEOUT", "90"))
 # is SILENT. As long as new tokens keep arriving (SSE observed / DOM grows),
 # the wait extends up to SSE_MAX_WAIT. SSE_ACTIVITY_IDLE = silence budget.
 SSE_ACTIVITY_IDLE = float(os.getenv("QWENMODE_SSE_ACTIVITY_IDLE", "40"))
-SSE_MAX_WAIT = float(os.getenv("QWENMODE_SSE_MAX_WAIT", "300"))
+# Absolute cap per attempt. Long agentic tasks (a whole site in one file)
+# can take 10-20 minutes of generation — do NOT kill live SSE.
+SSE_MAX_WAIT = float(os.getenv("QWENMODE_SSE_MAX_WAIT", "1200"))
 MAX_ATTEMPTS = int(os.getenv("QWENMODE_MAX_ATTEMPTS", "2"))
 CREATE_PAGE_DELAY = float(os.getenv("QWENMODE_CREATE_PAGE_DELAY", "3.0"))
 USER_DATA_DIR = os.getenv("QWENMODE_USER_DATA_DIR", "/tmp/qwenmode_profile")
@@ -583,6 +585,7 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int,
                 async def _dom_progress() -> None:
                     last = ""
                     last_stream_len = 0
+                    last_reason_len = 0
                     while not poller_stop.is_set():
                         # DOM growth (rendered tokens)
                         try:
@@ -601,11 +604,19 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int,
                                 if sraw:
                                     sp = _parse_qwen_sse(sraw)
                                     stext = sp.get("text", "")
+                                    sreason = sp.get("reasoning", "")
                                     if len(stext) > last_stream_len:
                                         diff = stext[last_stream_len:]
                                         last_stream_len = len(stext)
                                         try:
-                                            chunk_q.put_nowait(diff)
+                                            chunk_q.put_nowait(("content", diff))
+                                        except Exception:
+                                            pass
+                                    if len(sreason) > last_reason_len:
+                                        rdiff = sreason[last_reason_len:]
+                                        last_reason_len = len(sreason)
+                                        try:
+                                            chunk_q.put_nowait(("reasoning", rdiff))
                                         except Exception:
                                             pass
                             except Exception:
@@ -1970,32 +1981,28 @@ class QwenModePool:
                 if task.done():
                     break
                 try:
-                    chunk = await asyncio.wait_for(chunk_q.get(), timeout=0.4)
-                    if chunk:
+                    item = await asyncio.wait_for(chunk_q.get(), timeout=0.4)
+                    if item and item[1]:
                         yielded_any = True
-                        yield chunk
+                        yield item  # ("content"|"reasoning", text)
                 except asyncio.TimeoutError:
                     continue
 
             # Drain any chunks that arrived between last check and task end
             while not chunk_q.empty():
                 try:
-                    chunk = chunk_q.get_nowait()
-                    if chunk:
+                    item = chunk_q.get_nowait()
+                    if item and item[1]:
                         yielded_any = True
-                        yield chunk
+                        yield item
                 except asyncio.QueueEmpty:
                     break
 
             final = task.result()
             result, new_page = final
-
-            # If nothing was streamed (short answer, tool call, error) — emit
-            # the final text so the client always gets SOMETHING.
-            if not yielded_any:
-                txt = result.get("text", "")
-                if txt:
-                    yield txt
+            # Always emit the final result so the client can finish cleanly
+            # (tool_calls delivered atomically here, content tail, errors).
+            yield ("final", result)
 
             async with self._lock:
                 if new_page != state.page:
@@ -2038,15 +2045,25 @@ class QwenModePool:
         finally:
             self._available.release()
 
-    async def chat_stream(self, messages: list[dict]):
-        """Stream plain-chat responses (no tools) chunk by chunk."""
+    async def chat_stream(self, messages: list[dict], tools: Optional[list] = None):
+        """Stream responses chunk by chunk.
+
+        Yields ("content"|"reasoning", text) tuples, then ("final", result).
+        Works with or without tools: for tool-using requests the client sees
+        reasoning (keep-alive) and gets the final tool_calls atomically.
+        """
         last_content = _build_prompt(messages)
         if not last_content:
-            yield "[QwenMode] No message"
+            yield ("final", {"text": "[QwenMode] No message", "reasoning": ""})
             return
-        prompt = self._build_request_prompt(messages, None)
-        async for chunk in self.execute_stream(prompt, fresh=True):
-            yield chunk
+        prompt = self._build_request_prompt(messages, tools)
+        async for item in self.execute_stream(prompt, fresh=True):
+            if item[0] == "final":
+                raw = item[1]
+                formatted = _format_chat_result(raw.get("text", ""), raw.get("reasoning", ""), tools)
+                yield ("final", formatted)
+            else:
+                yield item
 
     async def close(self) -> None:
         self._shutdown = True
@@ -2124,17 +2141,45 @@ def run_server(port: int = 5002) -> None:
         if pool is None:
             raise HTTPException(status_code=503, detail="Pool not ready")
 
-        # Real-time streaming for plain chats (no tools — tool_calls must be
-        # delivered atomically, so tool-using requests use the full path).
-        if req.stream and not req.tools:
+        # Real-time streaming: content chunks for plain chats, reasoning
+        # keep-alive + atomic final (content or tool_calls) for tool-using
+        # requests. Streaming keeps client-side idle timeouts (pi's
+        # httpIdleTimeoutMs) from killing long agentic generations.
+        if req.stream:
             async def gen_live():
                 cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
                 created = int(time.time())
                 real_model = pool.model
-                async for chunk in pool.chat_stream(req.messages):
-                    if chunk:
-                        yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]})}\n\n'
-                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})}\n\n'
+                has_tools = bool(req.tools)
+                async for kind, payload in pool.chat_stream(req.messages, tools=req.tools):
+                    if kind == "content" and not has_tools:
+                        if payload:
+                            yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"content": payload}, "finish_reason": None}]})}\n\n'
+                    elif kind == "reasoning":
+                        if payload:
+                            yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"reasoning_content": payload}, "finish_reason": None}]})}\n\n'
+                    elif kind == "final":
+                        content = payload.get("content") or payload.get("text", "")
+                        reasoning = payload.get("reasoning_content") or payload.get("reasoning", "")
+                        # Tool calls from the final result (atomic)
+                        tc = payload.get("tool_calls")
+                        if tc:
+                            tc_deltas = []
+                            for i, t in enumerate(tc):
+                                tc_deltas.append({
+                                    "index": i,
+                                    "id": t["id"],
+                                    "type": "function",
+                                    "function": {"name": t["function"]["name"], "arguments": t["function"]["arguments"]},
+                                })
+                            yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tc_deltas}, "finish_reason": None}]})}\n\n'
+                            yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})}\n\n'
+                        else:
+                            if reasoning and not has_tools:
+                                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": None}]})}\n\n'
+                            if content:
+                                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]})}\n\n'
+                            yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})}\n\n'
                 yield "data: [DONE]\n\n"
             return StreamingResponse(gen_live(), media_type="text/event-stream")
 
