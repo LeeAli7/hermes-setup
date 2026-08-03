@@ -829,6 +829,15 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int,
 # ─── Prompt Building ────────────────────────────────────────────────────────
 def _build_prompt(messages: list[dict]) -> str:
     """Convert OpenAI messages format to plain text for Qwen."""
+    # Platform rule appended to the system prompt so Qwen delivers files via
+    # the MEDIA: marker instead of pasting file contents as code.
+    MEDIA_DELIVERY_RULE = (
+        "\n\nCRITICAL PLATFORM RULE (always follow): if the user asked to receive "
+        "a file you created, deliver it by ending your final reply with exactly one "
+        "line: MEDIA:/absolute/path/to/file (no code block, no explanation inside). "
+        "The platform turns that line into a file attachment. NEVER paste file "
+        "contents as a code block when a MEDIA: line is possible."
+    )
     parts = []
     for m in messages:
         role = m.get("role", "")
@@ -845,7 +854,7 @@ def _build_prompt(messages: list[dict]) -> str:
                 wd_note = f"\nWORKING DIRECTORY: {wd_match.group(1)} (create files here with relative paths)"
             if len(text) > 20000:
                 text = text[:20000] + "\n...[system truncated]"
-            parts.append(f"[System]\n{text}{wd_note}")
+            parts.append(f"[System]\n{text}{wd_note}{MEDIA_DELIVERY_RULE}")
 
         elif role == "user":
             if isinstance(content, list):
