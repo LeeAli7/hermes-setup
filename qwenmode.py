@@ -26,10 +26,39 @@ SSE_TIMEOUT = int(os.getenv("QWENMODE_SSE_TIMEOUT", "90"))
 # is SILENT. As long as new tokens keep arriving (SSE observed / DOM grows),
 # the wait extends up to SSE_MAX_WAIT. SSE_ACTIVITY_IDLE = silence budget.
 SSE_ACTIVITY_IDLE = float(os.getenv("QWENMODE_SSE_ACTIVITY_IDLE", "40"))
-# Absolute cap per attempt. Long agentic tasks (a whole site in one file)
-# can take 10-20 minutes of generation — do NOT kill live SSE.
+# Rolling "max silence" window: if the model emits NO new token (reasoning OR
+# content, via the fetch hook / SSE POST) for STALL_CAP seconds, the attempt
+# aborts and is retried. Every new token resets the deadline, so long agentic
+# generations never die as long as tokens keep flowing — only a true stall
+# (e.g. reasoning delivered, then the answer never materialises) aborts.
+STALL_CAP = float(os.getenv("QWENMODE_STALL_CAP", "120"))
+# If the SITE never opens the SSE stream at all (no POST to the chat endpoint
+# observed) within this many seconds, the send is silently dead (guest is
+# throttled/blocked). Abort the attempt as EMPTY rather than burn STALL_CAP.
+# A live generation always emits the SSE .created event within a second or two.
+EMPTY_NO_SSE = float(os.getenv("QWENMODE_EMPTY_NO_SSE", "30"))
+# Absolute cap kept as a safety net only; the streaming path is governed by
+# the rolling STALL_CAP above.
 SSE_MAX_WAIT = float(os.getenv("QWENMODE_SSE_MAX_WAIT", "1200"))
+# On a run of EMPTY responses, spin up a fresh guest profile (worse case) and
+# retry the whole request, rather than silently returning an empty answer.
+RECREATE_LIMIT = int(os.getenv("QWENMODE_RECREATE_LIMIT", "2"))
+# Rotate the guest profile after this many requests on the SAME page (done in
+# the background while idle, so it does not slow the request path). 0 disables.
+GUEST_ROTATE_EVERY = int(os.getenv("QWENMODE_GUEST_ROTATE_EVERY", "3"))
 MAX_ATTEMPTS = int(os.getenv("QWENMODE_MAX_ATTEMPTS", "2"))
+# Total wall-clock budget (seconds) a single request is allowed to keep
+# rotating to BRAND-NEW guest profiles on EMPTY / quota / overload responses,
+# so the client gets a REAL answer instead of an early error. Kept under the
+# client's own timeout. 0 disables the retry budget (uses MAX_ATTEMPTS only).
+EMPTY_RETRY_BUDGET = float(os.getenv("QWENMODE_EMPTY_RETRY_BUDGET", "180"))
+# Pause between guest-profile rotations (fresh sessions need a moment to be
+# un-throttled; avoid hammering the site with rapid re-launches).
+GUEST_COOLDOWN = float(os.getenv("QWENMODE_GUEST_COOLDOWN", "5"))
+# Wait up to this long for an idle page before surfacing "No available pages"
+# (smooths the transient window when a guest-profile rotation briefly has all
+# pages busy).
+NO_PAGE_TIMEOUT = float(os.getenv("QWENMODE_NO_PAGE_TIMEOUT", "20"))
 CREATE_PAGE_DELAY = float(os.getenv("QWENMODE_CREATE_PAGE_DELAY", "3.0"))
 USER_DATA_DIR = os.getenv("QWENMODE_USER_DATA_DIR", "/tmp/qwenmode_profile")
 HEADLESS = os.getenv("QWENMODE_HEADLESS", "true").lower() == "true"
@@ -56,6 +85,8 @@ if _PROXY:
     log.info(f"Using proxy: {_PROXY}")
 
 _SSE_URL_PATTERN = "/api/v2/chat/completions"
+# Enable to dump the live SSE request contract (headers/body) once per call.
+_DIAG_CAPTURE = os.getenv("QWENMODE_DIAG_SSE", "").lower() in ("1", "true", "yes")
 
 # ─── Page State ─────────────────────────────────────────────────────────────
 @dataclass
@@ -65,6 +96,7 @@ class PageState:
     resetting: bool = False
     last_used: float = field(default_factory=time.time)
     health_failures: int = 0
+    empty_streak: int = 0
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -364,6 +396,28 @@ def _detect_captcha(body_text: str) -> bool:
     return any(x in bl for x in ["security verification", "drag the slider", "captcha", "verify you"])
 
 
+def _detect_tool_error(text: str, declared_names: Optional[set]) -> Optional[str]:
+    """Return the offending tool name if Qwen tried a tool that isn't usable.
+
+    Two cases:
+      - Qwen Studio echoed a literal error like "Tool read does not exists.".
+      - A tool-call JSON referenced a tool the client did NOT declare in `tools`.
+    Returns the tool name to blame, or None if the response is fine.
+    """
+    if not text:
+        return None
+    # Studio's literal error, e.g. "Tool read does not exists.Tool read does not exists."
+    m = re.search(r"\btool\s+([A-Za-z_][\w.-]*)\s+does\s+not\s+exist", text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # JSON tool call naming an undeclared tool
+    if declared_names:
+        for name, _ in _extract_all_tool_calls(text):
+            if name and name not in declared_names:
+                return name
+    return None
+
+
 def _parse_qwen_sse(raw: str) -> dict:
     """Parse SSE stream from Qwen into text and reasoning."""
     if not raw:
@@ -386,6 +440,26 @@ def _parse_qwen_sse(raw: str) -> dict:
 
     reasoning_parts = []
     answer_parts = []
+    last_reasoning = None  # dedup: identical consecutive thinking_summary lines
+    last_answer = None     # dedup: identical consecutive content tokens
+
+    def _push_reasoning(txt: str) -> None:
+        nonlocal last_reasoning
+        if not txt:
+            return
+        if txt == last_reasoning:
+            return
+        last_reasoning = txt
+        reasoning_parts.append(txt)
+
+    def _push_answer(txt: str) -> None:
+        nonlocal last_answer
+        if not txt:
+            return
+        if txt == last_answer:
+            return
+        last_answer = txt
+        answer_parts.append(txt)
 
     for line in raw.split("\n"):
         line = line.strip()
@@ -406,6 +480,14 @@ def _parse_qwen_sse(raw: str) -> dict:
             err = ev["error"]
             code = err.get("code", "unknown") if isinstance(err, dict) else "unknown"
             details = err.get("details", "") if isinstance(err, dict) else str(err)
+            detail_lower = (details or "").lower()
+            # Transient terminal markers from Qwen when the stream is cut/ended
+            # (e.g. 'The request is ended!'). NOT a quota/limit error — treat as
+            # an aborted stream so the caller retries via the empty-response path
+            # instead of wiping the whole guest profile.
+            if ("request is ended" in detail_lower or "request ended" in detail_lower
+                    or "ended" in detail_lower and "!" in str(err)):
+                return {"text": "", "reasoning": ""}
             msg = f"[Qwen Error {code}]"
             if details:
                 msg += f" {details}"
@@ -423,16 +505,15 @@ def _parse_qwen_sse(raw: str) -> dict:
             thought = extra.get("summary_thought", {})
             thought_content = thought.get("content", [])
             if thought_content:
-                reasoning_parts.append(str(thought_content[0]))
+                _push_reasoning(str(thought_content[0]))
         elif phase == "answer" and content:
-            answer_parts.append(str(content))
+            _push_answer(str(content))
         elif phase == "tool_call" or phase == "tool":
             # Tool call phases — capture as content for parsing
-            if content:
-                answer_parts.append(str(content))
+            _push_answer(str(content)) if content else None
         elif content:
             # Any other phase with content — accept it
-            answer_parts.append(str(content))
+            _push_answer(str(content))
         elif delta.get("status") == "finished":
             break
 
@@ -496,6 +577,7 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int,
     capture_ts = [0.0]  # track latest capture timestamp
     progress_ts = [time.time()]  # last observed activity (SSE start/end, DOM growth)
     sse_started = [False]  # a POST to the SSE endpoint was observed
+    diag_dumped = [False]  # dump the SSE request contract exactly once per call
 
     async def capture(resp) -> None:
         if _SSE_URL_PATTERN in resp.url and bodies["raw"] is None:
@@ -519,6 +601,24 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int,
         if _SSE_URL_PATTERN in req.url and req.method == "POST":
             sse_started[0] = True
             progress_ts[0] = time.time()
+            # DIAG: dump the live SSE request contract (auth/headers/body) once.
+            try:
+                if not diag_dumped[0] and _DIAG_CAPTURE:
+                    diag_dumped[0] = True
+                    hdrs = dict(req.headers)
+                    hdrs_safe = {k: (v if not any(s in k.lower() for s in ("authorization", "token", "cookie")) else v[:40] + "...")
+                                 for k, v in hdrs.items()}
+                    post = None
+                    try:
+                        post = req.post_data
+                    except Exception:
+                        pass
+                    log.info(f"DIAG-SSE-REQ url={req.url[:180]!r}")
+                    log.info(f"DIAG-SSE-HEADERS {hdrs_safe!r}")
+                    if post:
+                        log.info(f"DIAG-SSE-BODY {post[:3000]!r}")
+            except Exception as e:
+                log.warning(f"DIAG-SSE-REQ failed: {e}")
 
     page.on("response", capture)
     page.on("request", on_request)
@@ -580,47 +680,47 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int,
                 # give up after SSE_ACTIVITY_IDLE seconds of total silence
                 # past the base timeout, or the SSE_MAX_WAIT absolute cap.
                 start_wait = time.time()
+                progress_ts[0] = time.time()
                 poller_stop = asyncio.Event()
 
                 async def _dom_progress() -> None:
-                    last = ""
                     last_stream_len = 0
                     last_reason_len = 0
                     while not poller_stop.is_set():
-                        # DOM growth (rendered tokens)
+                        # Live SSE chunks from the fetch hook -> forward to
+                        # client AND treat every new token as activity. DOM
+                        # growth is deliberately NOT used for activity: it
+                        # includes the echoed user prompt and toasts, which
+                        # kept the wait alive forever (the old 20-min hang).
                         try:
-                            txt = await asyncio.wait_for(
-                                _read_chat_from_dom(page, prompt), timeout=4
-                            )
-                            if txt and txt != last:
-                                last = txt
-                                progress_ts[0] = time.time()
-                        except Exception:
-                            pass
-                        # Live SSE chunks from the fetch hook -> forward to client
-                        if chunk_q is not None:
-                            try:
-                                sraw = await page.evaluate("() => window.__qwenStream || ''")
-                                if sraw:
-                                    sp = _parse_qwen_sse(sraw)
-                                    stext = sp.get("text", "")
-                                    sreason = sp.get("reasoning", "")
-                                    if len(stext) > last_stream_len:
-                                        diff = stext[last_stream_len:]
-                                        last_stream_len = len(stext)
+                            sraw = await page.evaluate("() => window.__qwenStream || ''")
+                            if sraw:
+                                sp = _parse_qwen_sse(sraw)
+                                stext = sp.get("text", "")
+                                sreason = sp.get("reasoning", "")
+                                progressed = False
+                                if len(stext) > last_stream_len:
+                                    diff = stext[last_stream_len:]
+                                    last_stream_len = len(stext)
+                                    progressed = True
+                                    if chunk_q is not None:
                                         try:
                                             chunk_q.put_nowait(("content", diff))
                                         except Exception:
                                             pass
-                                    if len(sreason) > last_reason_len:
-                                        rdiff = sreason[last_reason_len:]
-                                        last_reason_len = len(sreason)
+                                if len(sreason) > last_reason_len:
+                                    rdiff = sreason[last_reason_len:]
+                                    last_reason_len = len(sreason)
+                                    progressed = True
+                                    if chunk_q is not None:
                                         try:
                                             chunk_q.put_nowait(("reasoning", rdiff))
                                         except Exception:
                                             pass
-                            except Exception:
-                                pass
+                                if progressed:
+                                    progress_ts[0] = time.time()
+                        except Exception:
+                            pass
                         await asyncio.sleep(0.8)
 
                 poller = asyncio.create_task(_dom_progress())
@@ -629,16 +729,22 @@ async def _wait_for_response(page: Page, prompt: str, model: str, timeout: int,
                         if response_event.is_set():
                             break
                         now = time.time()
-                        if now - start_wait > SSE_MAX_WAIT:
-                            log.info(f"MAX_WAIT {SSE_MAX_WAIT}s exceeded, giving up")
+                        # The SITE never even opened the SSE stream (no POST to
+                        # the chat endpoint). This is a silently-dead send (guest
+                        # throttled/blocked), not a slow generation — a live Qwen
+                        # always emits the SSE .created POST within ~2s. Abort the
+                        # attempt fast instead of burning the full STALL_CAP.
+                        if not sse_started[0] and (now - start_wait) > EMPTY_NO_SSE:
+                            log.info(f"No SSE POST within {EMPTY_NO_SSE}s — silent dead send, aborting (will retry)")
                             break
-                        # NEVER give up while the SSE stream is still flowing:
-                        # Qwen thinks WITHOUT drawing tokens to the DOM (long
-                        # reasoning), so DOM silence does NOT mean the model is
-                        # stuck. Only the base-timeout + DOM-idle rule applies
-                        # when no SSE POST was observed at all.
-                        if not sse_started[0] and now - start_wait > timeout and now - progress_ts[0] > SSE_ACTIVITY_IDLE:
-                            log.info(f"No SSE observed, silent for {SSE_ACTIVITY_IDLE}s past {timeout}s base timeout, giving up")
+                        # Rolling stall: abort when the model went SILENT — no new
+                        # reasoning/content token and no SSE POST for STALL_CAP.
+                        # Every token resets progress_ts (see _dom_progress and
+                        # on_request), so a live long generation is never killed;
+                        # only a true stall (reasoning delivered, answer stuck)
+                        # triggers a fresh retry.
+                        if now - progress_ts[0] > STALL_CAP:
+                            log.info(f"No new token for {STALL_CAP}s — stalled, giving up (will retry)")
                             break
                         await asyncio.sleep(1)
                 finally:
@@ -1306,6 +1412,10 @@ class QwenModePool:
         # Cookie rotation
         self._cookie_pool: list[list[dict]] = []  # list of cookie sets
         self._cookie_idx: int = 0
+        # Profile recreation serialization: only ONE daily-limit wipe at a time.
+        # Concurrent limit hits wait and reuse the fresh profile instead of
+        # each wiping it again (reduces guest churn / stops torn states).
+        self._profile_lock = asyncio.Lock()
 
     def _scan_cookies(self) -> None:
         """Scan cookies/ directory for JSON files."""
@@ -1543,41 +1653,45 @@ class QwenModePool:
         the burned session cookies persist. Only a fresh profile (fresh
         cookies) restores unlimited guest usage.
         """
-        old = self._states[idx]
-        if old:
-            try:
-                await old.page.close()
-            except Exception:
-                pass
-        # Close the entire browser context (releases profile lock on disk)
-        if self.ctx:
-            try:
-                await self.ctx.close()
-            except Exception as e:
-                log.warning(f"Profile close failed: {e}")
-        # Wipe the profile dir — fresh guest cookies on next launch
-        for attempt in range(3):
-            try:
-                shutil.rmtree(USER_DATA_DIR, ignore_errors=True)
-                self.ctx = await self._launch_context()
-                if not GUEST_MODE:
-                    await self._apply_cookies()
-                # Recreate ALL pages (the old context hosted them all)
-                for i in range(self.size):
-                    try:
-                        page = await _create_page(self.ctx, self.model)
-                        self._states[i] = PageState(page=page)
-                    except Exception as e:
-                        log.warning(f"Profile recreate: page {i} failed: {e}")
-                        self._states[i] = None
-                if self._states[idx] is not None:
-                    log.info(f"Profile {idx} recreated — fresh guest session (dir wiped)")
-                    return
-            except Exception as e:
-                log.warning(f"Profile recreate attempt {attempt+1} failed: {e}")
-                await asyncio.sleep(5)
-        self._states[idx] = None
-        log.error(f"Profile {idx} recreate FAILED after 3 attempts")
+        # Serialize recreation: if another daily-limit hit is already wiping and
+        # relaunching the profile, wait for it and reuse the fresh session rather
+        # than tearing down again (avoids double-wipe / torn shared state).
+        async with self._profile_lock:
+            old = self._states[idx]
+            if old:
+                try:
+                    await old.page.close()
+                except Exception:
+                    pass
+            # Close the entire browser context (releases profile lock on disk)
+            if self.ctx:
+                try:
+                    await self.ctx.close()
+                except Exception as e:
+                    log.warning(f"Profile close failed: {e}")
+            # Wipe the profile dir — fresh guest cookies on next launch
+            for attempt in range(3):
+                try:
+                    shutil.rmtree(USER_DATA_DIR, ignore_errors=True)
+                    self.ctx = await self._launch_context()
+                    if not GUEST_MODE:
+                        await self._apply_cookies()
+                    # Recreate ALL pages (the old context hosted them all)
+                    for i in range(self.size):
+                        try:
+                            page = await _create_page(self.ctx, self.model)
+                            self._states[i] = PageState(page=page)
+                        except Exception as e:
+                            log.warning(f"Profile recreate: page {i} failed: {e}")
+                            self._states[i] = None
+                    if self._states[idx] is not None:
+                        log.info(f"Profile {idx} recreated — fresh guest session (dir wiped)")
+                        return
+                except Exception as e:
+                    log.warning(f"Profile recreate attempt {attempt+1} failed: {e}")
+                    await asyncio.sleep(5)
+            self._states[idx] = None
+            log.error(f"Profile {idx} recreate FAILED after 3 attempts")
 
     async def _heartbeat(self) -> None:
         while not self._shutdown:
@@ -1607,23 +1721,112 @@ class QwenModePool:
                     async with self._lock:
                         await self._recreate_page(i)
 
-    async def execute(self, prompt: str, fresh: bool = False) -> dict:
+    def _prep_sibling_fresh(self, busy_idx: int) -> None:
+        """Best-effort background refresh: while `busy_idx` serves the current
+        request, refresh every other idle page to a fresh home chat so the next
+        request lands instantly in a clean session (skips the goto cost on the
+        request's path). App errors are logged and ignored."""
+        def spawn(_i: int) -> None:
+            async def run() -> None:
+                st = self._states[_i]
+                if st is None or st.page is None:
+                    return
+                try:
+                    if st.busy or st.resetting:
+                        return
+                    if "/c/" not in str(st.page.url):
+                        return
+                    async with self._lock:
+                        if st.busy or st.resetting:
+                            return
+                        st.resetting = True
+                    try:
+                        await st.page.goto(URL, wait_until="domcontentloaded", timeout=20000)
+                        for _ in range(20):
+                            ta = await st.page.query_selector('textarea')
+                            if ta:
+                                break
+                            await asyncio.sleep(0.2)
+                        await _dismiss_auth_dialog(st.page)
+                        await _dismiss_modal(st.page)
+                        await _select_model(st.page, self.model)
+                    finally:
+                        st.resetting = False
+                        st.last_used = time.time()
+                except Exception as e:
+                    try:
+                        st = self._states[_i]
+                        if st is not None:
+                            st.resetting = False
+                    except Exception:
+                        pass
+                    log.info(f"Page {_i} bg pre-fresh: {e}")
+            try:
+                asyncio.create_task(run())
+            except Exception:
+                pass
+
+        for _i, st in enumerate(self._states):
+            if _i == busy_idx or st is None or st.busy or st.resetting:
+                continue
+            if "/c/" in str(st.page.url):
+                spawn(_i)
+
+    async def _wait_idle_page(self, timeout: float = NO_PAGE_TIMEOUT) -> int:
+        """Pick an idle page, waiting up to `timeout`s if every page is busy
+        (e.g. mid guest-profile recreation when all pages briefly vanish).
+        Prefers an already-fresh home page. Returns -1 if never idle.
+        """
+        deadline = time.time() + timeout
+        while True:
+            async with self._lock:
+                idx = -1
+                for i, st in enumerate(self._states):
+                    if st is not None and not st.busy and not st.resetting and "/c/" not in str(st.page.url):
+                        idx = i
+                        break
+                if idx == -1:
+                    for i, st in enumerate(self._states):
+                        if st is not None and not st.busy and not st.resetting:
+                            idx = i
+                            break
+                if idx != -1:
+                    self._states[idx].busy = True
+                    self._states[idx].last_used = time.time()
+                    return idx
+            if time.time() > deadline:
+                return -1
+            await asyncio.sleep(0.5)
+
+    async def execute(self, prompt: str, fresh: bool = False, tools: Optional[list] = None) -> dict:
         await self._available.acquire()
         try:
-            async with self._lock:
-                # Find available page
-                idx = -1
-                for i, state in enumerate(self._states):
-                    if state is not None and not state.busy and not state.resetting:
-                        idx = i
-                        state.busy = True
-                        state.last_used = time.time()
-                        break
-
-                if idx == -1:
-                    return {"text": "[QwenMode] No available pages", "reasoning": ""}
-
+            declared_names = set(_schema_params_for(tools).keys()) if tools else None
+            idx = await self._wait_idle_page()
+            if idx == -1:
+                return {"text": "[QwenMode] No available pages", "reasoning": ""}
             state = self._states[idx]
+
+            # If this page has already produced EMPTY session(s), the guest is
+            # likely silently dead. Rotate to a fresh guest NOW so we don't burn
+            # repeated ~120s silences on a dead session.
+            if state.empty_streak >= 1:
+                log.warning(f"Page {idx} streak={state.empty_streak} — rotating guest before sending")
+                try:
+                    async with self._lock:
+                        await self._recreate_profile(idx)
+                        ns = self._states[idx]
+                        if ns is not None:
+                            state = ns
+                            state.busy = True
+                            state.empty_streak = 0
+                except Exception as e:
+                    log.warning(f"Page {idx} rotate-on-streak failed: {e}")
+                state = self._states[idx]
+
+            # Background: pre-fresh idle sibling pages so the next request
+            # (always a new session) starts instantly, overlapping the goto.
+            self._prep_sibling_fresh(idx)
 
             # OpenAI API semantics: EVERY request lands in a CLEAN chat.
             # Navigate to home so Qwen opens a brand-new conversation. If we're
@@ -1660,12 +1863,46 @@ class QwenModePool:
             try:
                 result = None
                 last_error_text = ""
-                for attempt in range(4):
+                cur_prompt = prompt
+                retry_deadline = time.time() + EMPTY_RETRY_BUDGET if EMPTY_RETRY_BUDGET > 0 else None
+                for attempt in range(40 if EMPTY_RETRY_BUDGET > 0 else 4):
                     res, new_page = await _wait_for_response(
-                        state.page, prompt, self.model, SSE_TIMEOUT
+                        state.page, cur_prompt, self.model, SSE_TIMEOUT
                     )
                     text = res.get("text", "")
                     log.info(f"EXEC attempt={attempt} text_head={text[:120]!r}")
+                    if retry_deadline is not None and time.time() > retry_deadline:
+                        result = ({"text": last_error_text or "[QwenMode] Retry budget exhausted", "reasoning": ""}, state.page)
+                        break
+                    # ── Undeclared / built-in tool attempt ───────────────────
+                    bad_tool = _detect_tool_error(text, declared_names)
+                    if bad_tool and not text.startswith("[Qwen Error]"):
+                        last_error_text = f"[QwenMode] Tool '{bad_tool}' not supported — re-prompting model"
+                        if attempt < 3:
+                            allowed = ", ".join(sorted(declared_names)) if declared_names else "the tools already listed in the prompt"
+                            log.warning(f"Page {idx} used undeclared tool '{bad_tool}' (attempt {attempt}) — re-prompting")
+                            try:
+                                await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+                                await asyncio.sleep(1 + attempt)
+                                await _dismiss_auth_dialog(state.page)
+                                await _dismiss_modal(state.page)
+                                await _select_model(state.page, self.model)
+                                for _ in range(15):
+                                    ta = await state.page.query_selector('textarea')
+                                    if ta:
+                                        break
+                                    await asyncio.sleep(0.5)
+                            except Exception as e:
+                                log.warning(f"Page {idx} refresh failed on tool retry: {e}")
+                            cur_prompt = (
+                                f"{prompt}\n\n[HARD INSTRUCTION] Tool '{bad_tool}' does NOT exist in this "
+                                "system and will cause an error. You may ONLY use this exact set of tools: "
+                                f"{allowed}. Never invent a tool name or call a built-in Qwen tool. If you "
+                                "need a tool, reply with exactly ONE JSON object: "
+                                '{"tool": "NAME", "arguments": {...}} where NAME is one of the allowed tools; '
+                                "otherwise reply as plain text with no JSON."
+                            )
+                            continue
                     if text.startswith("[Qwen Error]"):
                         last_error_text = text
                         low = text.lower()
@@ -1689,12 +1926,29 @@ class QwenModePool:
                             continue
                         # ── Temporary throttle (high demand / quota_limit) ───
                         if "high demand" in low or "quota" in low:
-                            backoff = 20 + attempt * 25
-                            log.info(f"Page {idx} throttled (quota/high demand), backing off {backoff}s")
-                            await asyncio.sleep(backoff)
+                            # Same-page refresh can't help — the guest is the
+                            # problem. Rotate to a BRAND-NEW guest and retry.
+                            log.info(f"Page {idx} quota/overload: {text[:80]} — rotating to fresh guest")
+                            async with self._lock:
+                                await self._recreate_profile(idx)
+                                new_state = self._states[idx]
+                            state = new_state if new_state is not None else state
+                            await asyncio.sleep(GUEST_COOLDOWN)
+                            if self._states[idx] is None:
+                                result = ({"text": "[QwenMode] All fresh guests failed (quota)", "reasoning": ""}, state.page)
+                                break
+                            continue
+                        # ── Other Qwen errors (limit/usage wording) ──────────
+                        if not GUEST_MODE:
+                            self._rotate_cookies()
+                        elif attempt < 2:
+                            # Transient/unknown errors: first do a lightweight
+                            # refresh+resend. Do NOT wipe the whole guest profile
+                            # for an error that may just be a cut stream.
+                            log.info(f"Page {idx} guest error {text[:60]} — refresh & retry (attempt {attempt})")
                             try:
                                 await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
-                                await asyncio.sleep(2)
+                                await asyncio.sleep(1 + attempt)
                                 await _dismiss_auth_dialog(state.page)
                                 await _dismiss_modal(state.page)
                                 await _select_model(state.page, self.model)
@@ -1704,15 +1958,12 @@ class QwenModePool:
                                         break
                                     await asyncio.sleep(0.5)
                             except Exception as e:
-                                log.warning(f"Page {idx} refresh failed on throttle retry: {e}")
-                            continue  # Retry same page after backoff
-                        # ── Other Qwen errors (limit/usage wording) ──────────
-                        if not GUEST_MODE:
-                            self._rotate_cookies()
+                                log.warning(f"Page {idx} refresh failed on guest error retry: {e}")
+                            continue
                         else:
-                            # Guest mode: unknown limit wording — safest is a
-                            # fresh guest session (burned cookies are useless).
-                            log.info(f"Guest mode: rotating profile for {text[:80]}")
+                            # Same error kept repeating — the guest session is likely
+                            # burned. Fall back to a fresh guest profile.
+                            log.info(f"Guest mode: persistent error, rotating profile for {text[:80]}")
                             async with self._lock:
                                 await self._recreate_profile(idx)
                                 new_state = self._states[idx]
@@ -1723,27 +1974,24 @@ class QwenModePool:
                             await asyncio.sleep(15)
                             continue
                     elif not text.strip():
-                        # ── EMPTY response ───────────────────────────────────
-                        # Qwen returned nothing (SSE missed / DOM empty / send
-                        # swallowed). NEVER return empty to the client: refresh
-                        # and resend. Escalate on later attempts.
-                        log.warning(f"Page {idx} EMPTY response (attempt {attempt}) — refreshing and retrying")
+                        # EMPTY: send left but the SITE never streamed back in
+                        # time (guest silently throttled/blocked). goto refresh
+                        # won't help — cookies persist. Rotate to a BRAND-NEW
+                        # guest profile so the retry runs un-throttled.
+                        self._states[idx].empty_streak += 1
                         last_error_text = "[QwenMode] Empty response"
-                        if attempt < 3:
-                            try:
-                                await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
-                                await asyncio.sleep(2 + attempt * 3)
-                                await _dismiss_auth_dialog(state.page)
-                                await _dismiss_modal(state.page)
-                                await _select_model(state.page, self.model)
-                                for _ in range(15):
-                                    ta = await state.page.query_selector('textarea')
-                                    if ta:
-                                        break
-                                    await asyncio.sleep(0.5)
-                            except Exception as e:
-                                log.warning(f"Page {idx} refresh failed on empty retry: {e}")
-                            continue
+                        log.warning(f"Page {idx} EMPTY (attempt {attempt}) — rotating to fresh guest")
+                        async with self._lock:
+                            await self._recreate_profile(idx)
+                            new_state = self._states[idx]
+                        state = new_state if new_state is not None else state
+                        await asyncio.sleep(GUEST_COOLDOWN)
+                        if self._states[idx] is None:
+                            result = ({"text": "[QwenMode] All fresh guests failed (profile gone)", "reasoning": ""}, state.page)
+                            break
+                        continue  # keep rotating to a NEW guest within the budget
+                    if text.strip() and self._states[idx] is not None:
+                        self._states[idx].empty_streak = 0
                     result = (res, new_page)
                     break
 
@@ -1804,6 +2052,16 @@ class QwenModePool:
                 raise
 
         finally:
+            # Always free the page — even on a client disconnect / generator
+            # cancellation / error — or the slot leaks busy forever and the
+            # pool reports "No available pages".
+            try:
+                cs = self._states[idx]
+                if cs is not None:
+                    cs.busy = False
+                    cs.resetting = False
+            except Exception:
+                pass
             self._available.release()
 
     async def chat(self, messages: list[dict], tools: Optional[list] = None) -> dict:
@@ -1822,7 +2080,7 @@ class QwenModePool:
 
         prompt = self._build_request_prompt(messages, tools)
 
-        result = await self.execute(prompt, fresh=True)
+        result = await self.execute(prompt, fresh=True, tools=tools)
         return _format_chat_result(result.get("text", ""), result.get("reasoning", ""), tools)
 
     def _build_request_prompt(self, messages: list[dict], tools: Optional[list]) -> str:
@@ -1847,7 +2105,7 @@ class QwenModePool:
             return _build_tool_prompt(last_content, tools)
         return last_content
 
-    async def execute_stream(self, prompt: str, fresh: bool = False):
+    async def execute_stream(self, prompt: str, fresh: bool = False, tools: Optional[list] = None):
         """Like execute(), but YIELDS incremental text chunks as Qwen generates.
 
         Live streaming via the window.__qwenStream fetch hook (see
@@ -1857,18 +2115,32 @@ class QwenModePool:
         """
         await self._available.acquire()
         try:
-            async with self._lock:
-                idx = -1
-                for i, state in enumerate(self._states):
-                    if state is not None and not state.busy and not state.resetting:
-                        idx = i
-                        state.busy = True
-                        state.last_used = time.time()
-                        break
-                if idx == -1:
-                    yield "[QwenMode] No available pages"
-                    return
+            idx = await self._wait_idle_page()
+            if idx == -1:
+                yield ("final", {"text": "[QwenMode] No available pages", "reasoning": ""})
+                return
             state = self._states[idx]
+
+            # If this page has already produced EMPTY session(s), the guest is
+            # likely silently dead. Rotate to a fresh guest NOW so we don't burn
+            # repeated ~120s silences on a dead session.
+            if state.empty_streak >= 1:
+                log.warning(f"Page {idx} streak={state.empty_streak} — rotating guest before sending")
+                try:
+                    async with self._lock:
+                        await self._recreate_profile(idx)
+                        ns = self._states[idx]
+                        if ns is not None:
+                            state = ns
+                            state.busy = True
+                            state.empty_streak = 0
+                except Exception as e:
+                    log.warning(f"Page {idx} rotate-on-streak failed: {e}")
+                state = self._states[idx]
+
+            # Background: pre-fresh idle sibling pages so the next request
+            # (always a new session) starts instantly, overlapping the goto.
+            self._prep_sibling_fresh(idx)
 
             if fresh:
                 try:
@@ -1892,22 +2164,59 @@ class QwenModePool:
                     await self._recreate_page(idx)
                     state = self._states[idx]
                     if state is None:
-                        yield "[QwenMode] Page unavailable after recreate"
+                        yield ("final", {"text": "[QwenMode] Page unavailable after recreate", "reasoning": ""})
                         return
                     state.busy = True
 
             chunk_q: asyncio.Queue = asyncio.Queue()
 
+            chunk_q: asyncio.Queue = asyncio.Queue()
+            declared_names = set(_schema_params_for(tools).keys()) if tools else None
+
             async def _attempt_loop():
                 nonlocal state
                 result = None
                 last_error_text = ""
-                for attempt in range(4):
+                cur_prompt = prompt
+                retry_deadline = time.time() + EMPTY_RETRY_BUDGET if EMPTY_RETRY_BUDGET > 0 else None
+                for attempt in range(40 if EMPTY_RETRY_BUDGET > 0 else 4):
                     res, new_page = await _wait_for_response(
-                        state.page, prompt, self.model, SSE_TIMEOUT, chunk_q
+                        state.page, cur_prompt, self.model, SSE_TIMEOUT, chunk_q
                     )
                     text = res.get("text", "")
                     log.info(f"EXEC-STREAM attempt={attempt} text_head={text[:120]!r}")
+                    if retry_deadline is not None and time.time() > retry_deadline:
+                        result = ({"text": last_error_text or "[QwenMode] Retry budget exhausted", "reasoning": ""}, state.page)
+                        break
+                    # ── Undeclared / built-in tool attempt ───────────────────
+                    bad_tool = _detect_tool_error(text, declared_names)
+                    if bad_tool and not text.startswith("[Qwen Error]"):
+                        last_error_text = f"[QwenMode] Tool '{bad_tool}' not supported — re-prompting model"
+                        if attempt < 3:
+                            allowed = ", ".join(sorted(declared_names)) if declared_names else "the tools already listed in the prompt"
+                            log.warning(f"Page {idx} used undeclared tool '{bad_tool}' (attempt {attempt}) — re-prompting")
+                            try:
+                                await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+                                await asyncio.sleep(1 + attempt)
+                                await _dismiss_auth_dialog(state.page)
+                                await _dismiss_modal(state.page)
+                                await _select_model(state.page, self.model)
+                                for _ in range(15):
+                                    ta = await state.page.query_selector('textarea')
+                                    if ta:
+                                        break
+                                    await asyncio.sleep(0.5)
+                            except Exception as e:
+                                log.warning(f"Page {idx} refresh failed on tool retry: {e}")
+                            cur_prompt = (
+                                f"{prompt}\n\n[HARD INSTRUCTION] Tool '{bad_tool}' does NOT exist in this "
+                                "system and will cause an error. You may ONLY use this exact set of tools: "
+                                f"{allowed}. Never invent a tool name or call a built-in Qwen tool. If you "
+                                "need a tool, reply with exactly ONE JSON object: "
+                                '{"tool": "NAME", "arguments": {...}} where NAME is one of the allowed tools; '
+                                "otherwise reply as plain text with no JSON."
+                            )
+                            continue
                     if text.startswith("[Qwen Error]"):
                         last_error_text = text
                         low = text.lower()
@@ -1923,12 +2232,26 @@ class QwenModePool:
                             await asyncio.sleep(20 + attempt * 10)
                             continue
                         if "high demand" in low or "quota" in low:
-                            backoff = 20 + attempt * 25
-                            log.info(f"Page {idx} throttled (quota/high demand), backing off {backoff}s")
-                            await asyncio.sleep(backoff)
+                            log.info(f"Page {idx} quota/overload: {text[:80]} — rotating to fresh guest")
+                            async with self._lock:
+                                await self._recreate_profile(idx)
+                                new_state = self._states[idx]
+                            state = new_state if new_state is not None else state
+                            await asyncio.sleep(GUEST_COOLDOWN)
+                            if self._states[idx] is None:
+                                result = ({"text": "[QwenMode] All fresh guests failed (quota)", "reasoning": ""}, state.page)
+                                break
+                            continue
+                        # ── Other Qwen errors ────────────────────────────
+                        if not GUEST_MODE:
+                            self._rotate_cookies()
+                        elif attempt < 2:
+                            # Transient/unknown error — refresh+resend first,
+                            # don't wipe the guest profile for a cut stream.
+                            log.info(f"Page {idx} guest error {text[:60]} — refresh & retry (attempt {attempt})")
                             try:
                                 await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
-                                await asyncio.sleep(2)
+                                await asyncio.sleep(1 + attempt)
                                 await _dismiss_auth_dialog(state.page)
                                 await _dismiss_modal(state.page)
                                 await _select_model(state.page, self.model)
@@ -1938,39 +2261,42 @@ class QwenModePool:
                                         break
                                     await asyncio.sleep(0.5)
                             except Exception as e:
-                                log.warning(f"Page {idx} refresh failed on throttle retry: {e}")
+                                log.warning(f"Page {idx} refresh failed on guest error retry: {e}")
                             continue
-                        log.info(f"Guest mode: rotating profile for {text[:80]}")
+                        else:
+                            log.info(f"Guest mode: persistent error, rotating profile for {text[:80]}")
+                            async with self._lock:
+                                await self._recreate_profile(idx)
+                                new_state = self._states[idx]
+                                if new_state is None:
+                                    return ({"text": "[QwenMode] Guest session recreate failed", "reasoning": ""}, state.page)
+                                new_state.busy = True
+                            state = new_state
+                            await asyncio.sleep(15)
+                            continue
+                    elif not text.strip():
+                        # EMPTY: the send left but the SITE never streamed back
+                        # in time (guest silently throttled/blocked). goto
+                        # refresh never helps a throttled guest — the cookies
+                        # persist. Rotate to a BRAND-NEW guest profile so the
+                        # retry runs on an un-throttled session.
+                        self._states[idx].empty_streak += 1
+                        last_error_text = "[QwenMode] Empty response"
+                        log.warning(f"Page {idx} EMPTY (attempt {attempt}) — rotating to fresh guest")
                         async with self._lock:
                             await self._recreate_profile(idx)
                             new_state = self._states[idx]
-                            if new_state is None:
-                                return ({"text": "[QwenMode] Guest session recreate failed", "reasoning": ""}, state.page)
-                            new_state.busy = True
-                        state = new_state
-                        await asyncio.sleep(15)
-                        continue
-                    elif not text.strip():
-                        log.warning(f"Page {idx} EMPTY response (attempt {attempt}) — refreshing and retrying")
-                        last_error_text = "[QwenMode] Empty response"
-                        if attempt < 3:
-                            try:
-                                await state.page.goto(URL, wait_until="domcontentloaded", timeout=30000)
-                                await asyncio.sleep(2 + attempt * 3)
-                                await _dismiss_auth_dialog(state.page)
-                                await _dismiss_modal(state.page)
-                                await _select_model(state.page, self.model)
-                                for _ in range(15):
-                                    ta = await state.page.query_selector('textarea')
-                                    if ta:
-                                        break
-                                    await asyncio.sleep(0.5)
-                            except Exception as e:
-                                log.warning(f"Page {idx} refresh failed on empty retry: {e}")
-                            continue
+                        state = new_state if new_state is not None else state
+                        await asyncio.sleep(GUEST_COOLDOWN)
+                        if self._states[idx] is None:
+                            result = ({"text": "[QwenMode] All fresh guests failed (profile gone)", "reasoning": ""}, state.page)
+                            break
+                        continue  # keep rotating to a NEW guest within the budget
+                    if text.strip() and self._states[idx] is not None:
+                        self._states[idx].empty_streak = 0
                     result = (res, new_page)
                     break
-
+                # End of attempt loop.
                 if result is None:
                     result = ({"text": last_error_text or "[QwenMode] No response after 4 attempts", "reasoning": ""}, state.page)
                 return result
@@ -2043,6 +2369,15 @@ class QwenModePool:
                     state.resetting = False
                     state.last_used = time.time()
         finally:
+            # Always free the page on disconnect/cancel/error so a slot can
+            # never leak busy (which would surface as "No available pages").
+            try:
+                cs = self._states[idx]
+                if cs is not None:
+                    cs.busy = False
+                    cs.resetting = False
+            except Exception:
+                pass
             self._available.release()
 
     async def chat_stream(self, messages: list[dict], tools: Optional[list] = None):
@@ -2057,7 +2392,7 @@ class QwenModePool:
             yield ("final", {"text": "[QwenMode] No message", "reasoning": ""})
             return
         prompt = self._build_request_prompt(messages, tools)
-        async for item in self.execute_stream(prompt, fresh=True):
+        async for item in self.execute_stream(prompt, fresh=True, tools=tools):
             if item[0] == "final":
                 raw = item[1]
                 formatted = _format_chat_result(raw.get("text", ""), raw.get("reasoning", ""), tools)
@@ -2151,12 +2486,22 @@ def run_server(port: int = 5002) -> None:
                 created = int(time.time())
                 real_model = pool.model
                 has_tools = bool(req.tools)
-                async for kind, payload in pool.chat_stream(req.messages, tools=req.tools):
+                # Live chunks (via the fetch hook) already stream content/reasoning.
+                # Track how much was sent so the final chunk only emits the TAIL —
+                # otherwise clients concatenate deltas and get duplicated output.
+                streamed_content_len = 0
+                streamed_reasoning_len = 0
+                async for item in pool.chat_stream(req.messages, tools=req.tools):
+                    if not isinstance(item, tuple) or len(item) < 2:
+                        continue  # defensive: never let a bad yield kill the SSE stream
+                    kind, payload = item[0], item[1]
                     if kind == "content" and not has_tools:
                         if payload:
+                            streamed_content_len += len(payload)
                             yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"content": payload}, "finish_reason": None}]})}\n\n'
                     elif kind == "reasoning":
                         if payload:
+                            streamed_reasoning_len += len(payload)
                             yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"reasoning_content": payload}, "finish_reason": None}]})}\n\n'
                     elif kind == "final":
                         content = payload.get("content") or payload.get("text", "")
@@ -2175,10 +2520,14 @@ def run_server(port: int = 5002) -> None:
                             yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tc_deltas}, "finish_reason": None}]})}\n\n'
                             yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})}\n\n'
                         else:
-                            if reasoning and not has_tools:
-                                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": None}]})}\n\n'
+                            if reasoning:
+                                tail = reasoning[streamed_reasoning_len:]
+                                if tail:
+                                    yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"reasoning_content": tail}, "finish_reason": None}]})}\n\n'
                             if content:
-                                yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]})}\n\n'
+                                tail = content[streamed_content_len:]
+                                if tail:
+                                    yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}]})}\n\n'
                             yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created, "model": real_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})}\n\n'
                 yield "data: [DONE]\n\n"
             return StreamingResponse(gen_live(), media_type="text/event-stream")

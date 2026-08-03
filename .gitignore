@@ -7,3 +7,7 @@ tor/Data/
 tor/tor.log
 __pycache__/
 tor/tor-start.log
+qwen_profile/
+cookies*.json
+cookies/
+*.log
