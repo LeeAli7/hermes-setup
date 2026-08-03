@@ -1095,18 +1095,27 @@ def _extract_all_tool_calls(text: str) -> list[tuple[str, dict]]:
         if isinstance(inner, dict):
             obj = inner
         fn = obj.get("function")
+        name_src = None
         name = obj.get("tool")
-        if not isinstance(name, str):
+        if isinstance(name, str):
+            name_src = "tool"
+        else:
             name = obj.get("name")
+            if isinstance(name, str):
+                name_src = "name"
         if not isinstance(name, str) and isinstance(fn, dict):
             name = fn.get("name")
+            if isinstance(name, str):
+                name_src = "function"
         if not isinstance(name, str) and isinstance(fn, str):
             name = fn
+            name_src = "function"
         if not isinstance(name, str):
             # {"tool": {"name": ...}}
             t = obj.get("tool")
             if isinstance(t, dict):
                 name = t.get("name") or t.get("tool")
+                name_src = "tool"
         if not name:
             return
         name = str(name).strip()
@@ -1126,6 +1135,14 @@ def _extract_all_tool_calls(text: str) -> list[tuple[str, dict]]:
                 if k in fn:
                     raw_args = fn[k]
                     break
+        # CRITICAL: a bare {"name": "X"} (no tool/function key, no arguments)
+        # is a NESTED argument object (e.g. {"tool": "skill_view",
+        # "arguments": {"name": "developer-portfolio"}}), NOT a tool call.
+        # Treating it as one makes _detect_tool_error flag legit calls as
+        # "undeclared tool" -> infinite re-prompt loop. Only accept a bare
+        # name when it actually carries arguments.
+        if name_src == "name" and raw_args is None:
+            return
         args = {}
         if isinstance(raw_args, dict):
             args = raw_args
