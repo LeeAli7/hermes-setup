@@ -1398,7 +1398,7 @@ def _load_cookies_from_file(filepath: str) -> list[dict]:
 
 
 class QwenModePool:
-    def __init__(self, size: int = POOL_SIZE, model: str = "Qwen3.8-Max-Preview", headless: bool = HEADLESS):
+    def __init__(self, size: int = POOL_SIZE, model: str = "Qwen3.8-Max", headless: bool = HEADLESS):
         self.size = size
         self.model = model
         self.headless = headless
@@ -2436,7 +2436,7 @@ def run_server(port: int = 5002) -> None:
     async def lifespan(app: FastAPI):
         nonlocal pool
         logging.basicConfig(level=logging.INFO)
-        pool = QwenModePool(size=POOL_SIZE, model="Qwen3.8-Max-Preview")
+        pool = QwenModePool(size=POOL_SIZE, model="Qwen3.8-Max")
         await pool.start()
         yield
         await pool.close()
@@ -2452,7 +2452,7 @@ def run_server(port: int = 5002) -> None:
     )
 
     class ChatRequest(BaseModel):
-        model: str = "Qwen3.8-Max-Preview"
+        model: str = "Qwen3.8-Max"
         messages: list
         stream: bool = False
         tools: Optional[list] = None
@@ -2613,7 +2613,7 @@ def run_server(port: int = 5002) -> None:
         return {
             "object": "list",
             "data": [{
-                "id": "Qwen3.8-Max-Preview",
+                "id": "Qwen3.8-Max",
                 "object": "model",
                 "created": 1700000000,
                 "owned_by": "qwenmode",
