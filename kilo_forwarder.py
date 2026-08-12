@@ -248,23 +248,40 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 log.warning(f"429 for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
                 resp.close()
 
-                if ROTATE_ON_429 and not rotated:
+                if ROTATE_ON_429:
                     rotated = renew_tor_ip()
-                    continue
+                    if rotated:
+                        continue
+                    log.warning("IP rotation failed on 429, waiting before retry")
 
                 if attempt < RETRY_ATTEMPTS - 1:
                     time.sleep(wait)
 
             except requests.exceptions.Timeout:
                 log.error(f"Timeout for {method} {self.path}")
+                if attempt < RETRY_ATTEMPTS - 1:
+                    log.warning("Timeout detected, rotating Tor IP and retrying...")
+                    if not rotated:
+                        rotated = renew_tor_ip()
+                    continue
                 self.send_error(502, "Forwarder Error: Upstream timeout")
                 return
             except requests.exceptions.ProxyError as e:
                 log.error(f"ProxyError for {method} {self.path}: {e}")
+                if attempt < RETRY_ATTEMPTS - 1:
+                    log.warning("ProxyError detected, rotating Tor IP and retrying...")
+                    if not rotated:
+                        rotated = renew_tor_ip()
+                    continue
                 self.send_error(502, "Forwarder Error: Proxy failed")
                 return
             except requests.exceptions.ConnectionError as e:
                 log.error(f"ConnectionError for {method} {self.path}: {e}")
+                if attempt < RETRY_ATTEMPTS - 1:
+                    log.warning("ConnectionError detected, rotating Tor IP and retrying...")
+                    if not rotated:
+                        rotated = renew_tor_ip()
+                    continue
                 self.send_error(502, "Forwarder Error: Connection failed")
                 return
             except Exception as e:

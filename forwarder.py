@@ -29,7 +29,7 @@ UPSTREAM_CONNECT_TIMEOUT = 60
 # opencode CLI survives by retrying with backoff (isRetryable=true).
 # So on 429 we: retry with backoff -> rotate Tor once -> retry, and if the
 # model keeps failing, fall back to a known-alive model (env-configurable).
-RETRY_ATTEMPTS = int(os.environ.get("FORWARDER_429_ATTEMPTS", "6"))
+RETRY_ATTEMPTS = int(os.environ.get("FORWARDER_429_ATTEMPTS", "10"))
 RETRY_BACKOFF = float(os.environ.get("FORWARDER_429_BACKOFF", "8"))
 MAX_BACKOFF = float(os.environ.get("FORWARDER_429_MAX_BACKOFF", "40"))
 ROTATE_ON_429 = os.environ.get("FORWARDER_ROTATE_ON_429", "1") == "1"
@@ -77,7 +77,25 @@ def get_cookie_path():
 
 def renew_tor_ip():
     if not _rotate_lock.acquire(blocking=False):
-        log.warning("IP rotation already in progress, skipping")
+        log.warning("IP rotation already in progress, waiting for it to finish")
+        try:
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+            old_ts = state.get("last_rotation_time", 0)
+        except:
+            old_ts = 0
+        for _ in range(20):
+            time.sleep(0.5)
+            try:
+                with open(STATE_FILE) as f:
+                    state = json.load(f)
+                new_ts = state.get("last_rotation_time", 0)
+            except:
+                new_ts = 0
+            if new_ts > old_ts:
+                log.info("Waiting for in-progress rotation: done")
+                return True
+        log.warning("Waiting for in-progress rotation: timed out")
         return False
     try:
         cookie_path = get_cookie_path()
@@ -88,41 +106,52 @@ def renew_tor_ip():
         with open(cookie_path, "rb") as f:
             cookie = f.read()
 
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(10)
-        s.connect(("127.0.0.1", CONTROL_PORT))
-        s.sendall(b"AUTHENTICATE " + binascii.hexlify(cookie) + b"\r\n")
-        resp = s.recv(1024)
-        if not resp.startswith(b"250"):
-            log.error(f"Tor auth failed: {resp}")
+        try:
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+            old_ip = state.get("tor_exit_ip")
+        except:
+            old_ip = None
+
+        for attempt in range(4):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10)
+            s.connect(("127.0.0.1", CONTROL_PORT))
+            s.sendall(b"AUTHENTICATE " + binascii.hexlify(cookie) + b"\r\n")
+            resp = s.recv(1024)
+            if not resp.startswith(b"250"):
+                log.error(f"Tor auth failed: {resp}")
+                s.close()
+                return False
+
+            s.sendall(b"SIGNAL NEWNYM\r\n")
+            resp = s.recv(1024)
             s.close()
-            return False
+            if not resp.startswith(b"250"):
+                log.error(f"NEWNYM failed: {resp}")
+                return False
 
-        s.sendall(b"SIGNAL NEWNYM\r\n")
-        resp = s.recv(1024)
-        s.close()
-        if not resp.startswith(b"250"):
-            log.error(f"NEWNYM failed: {resp}")
-            return False
+            log.info("Tor NEWNYM sent, waiting 5s for new IP")
+            time.sleep(5)
 
-        log.info("Tor NEWNYM sent, waiting 5s for new IP")
-        time.sleep(5)
+            new_ip = get_tor_ip()
+            if new_ip and new_ip != old_ip:
+                log.info(f"New Tor IP: {new_ip}")
+                try:
+                    with open(STATE_FILE) as f:
+                        state = json.load(f)
+                except:
+                    state = {}
+                state["current_proxy"] = f"socks5h://127.0.0.1:{SOCKS_PORT}"
+                state["tor_exit_ip"] = new_ip
+                state["last_rotation_time"] = time.time()
+                state["total_ip_switches"] = state.get("total_ip_switches", 0) + 1
+                with open(STATE_FILE, "w") as f:
+                    json.dump(state, f)
+                return True
+            log.warning(f"NEWNYM attempt {attempt+1}: IP unchanged ({new_ip}), retrying")
 
-        new_ip = get_tor_ip()
-        if new_ip:
-            log.info(f"New Tor IP: {new_ip}")
-            try:
-                with open(STATE_FILE) as f:
-                    state = json.load(f)
-            except:
-                state = {}
-            state["current_proxy"] = f"socks5h://127.0.0.1:{SOCKS_PORT}"
-            state["tor_exit_ip"] = new_ip
-            state["last_rotation_time"] = time.time()
-            state["total_ip_switches"] = state.get("total_ip_switches", 0) + 1
-            with open(STATE_FILE, "w") as f:
-                json.dump(state, f)
-            return True
+        log.error("IP rotation failed: IP did not change after 4 NEWNYM attempts")
         return False
     except Exception as e:
         log.error(f"IP rotation error: {e}")
@@ -286,23 +315,40 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 log.warning(f"429 for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
                 resp.close()
 
-                if ROTATE_ON_429 and not rotated:
+                if ROTATE_ON_429:
                     rotated = renew_tor_ip()
-                    continue
+                    if rotated:
+                        continue
+                    log.warning("IP rotation failed on 429, waiting before retry")
 
                 if attempt < RETRY_ATTEMPTS - 1:
                     time.sleep(wait)
 
             except requests.exceptions.Timeout:
                 log.error(f"Timeout for {method} {self.path}")
+                if attempt < RETRY_ATTEMPTS - 1:
+                    log.warning("Timeout detected, rotating Tor IP and retrying...")
+                    if not rotated:
+                        rotated = renew_tor_ip()
+                    continue
                 self.send_error(502, "Forwarder Error: Upstream timeout")
                 return
             except requests.exceptions.ProxyError as e:
                 log.error(f"ProxyError for {method} {self.path}: {e}")
+                if attempt < RETRY_ATTEMPTS - 1:
+                    log.warning("ProxyError detected, rotating Tor IP and retrying...")
+                    if not rotated:
+                        rotated = renew_tor_ip()
+                    continue
                 self.send_error(502, "Forwarder Error: Proxy failed")
                 return
             except requests.exceptions.ConnectionError as e:
                 log.error(f"ConnectionError for {method} {self.path}: {e}")
+                if attempt < RETRY_ATTEMPTS - 1:
+                    log.warning("ConnectionError detected, rotating Tor IP and retrying...")
+                    if not rotated:
+                        rotated = renew_tor_ip()
+                    continue
                 self.send_error(502, "Forwarder Error: Connection failed")
                 return
             except Exception as e:
