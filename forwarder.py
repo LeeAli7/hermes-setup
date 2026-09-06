@@ -23,6 +23,7 @@ CONTROL_PORT = 9051
 SOCKS_PORT = 9050
 UPSTREAM_READ_TIMEOUT = 300  # upstream response timeout (seconds)
 UPSTREAM_CONNECT_TIMEOUT = 60
+MAX_BODY_SIZE = int(os.environ.get("FORWARDER_MAX_BODY", str(20 * 1024 * 1024)))  # 20MB
 
 # --- 429 handling ---
 # FreeUsageLimitError / provider rate limits are intermittent:
@@ -74,6 +75,9 @@ def get_proxy():
 def get_cookie_path():
     return os.path.join(BASE_DIR, "tor", "Data", "control_auth_cookie")
 
+def get_tor_password():
+    return os.environ.get("TOR_CONTROL_PASSWORD", "hermes_tor_control")
+
 
 def renew_tor_ip():
     if not _rotate_lock.acquire(blocking=False):
@@ -98,7 +102,36 @@ def renew_tor_ip():
         log.warning("Waiting for in-progress rotation: timed out")
         return False
     try:
+        password = get_tor_password()
         cookie_path = get_cookie_path()
+        
+        # Try password auth first
+        if password:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(10)
+                s.connect(("127.0.0.1", CONTROL_PORT))
+                s.sendall(b"AUTHENTICATE \"" + password.encode() + b"\"\r\n")
+                resp = s.recv(1024)
+                if resp.startswith(b"250"):
+                    log.info("Tor control authenticated via password")
+                    s.sendall(b"SIGNAL NEWNYM\r\n")
+                    resp = s.recv(1024)
+                    s.close()
+                    if resp.startswith(b"250"):
+                        log.info("Tor IP rotation signal sent")
+                        time.sleep(5)
+                        return True
+                    else:
+                        log.error(f"NEWNYM failed: {resp}")
+                        return False
+                else:
+                    log.error(f"Tor password auth failed: {resp}")
+                    s.close()
+            except Exception as e:
+                log.error(f"Tor control error: {e}")
+        
+        # Fallback to cookie auth
         if not os.path.exists(cookie_path):
             log.error(f"Tor cookie not found at {cookie_path}")
             return False
@@ -267,9 +300,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def handle_request(self, method):
         content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > MAX_BODY_SIZE:
+            log.warning(f"Body too large: {content_length} bytes (max {MAX_BODY_SIZE})")
+            self.send_error(413, f"Request body too large: {content_length} bytes")
+            return
         body = None
         if content_length > 0:
             body = self.rfile.read(content_length)
+            log.info(f"Body read: {len(body)} bytes for {method} {self.path}")
 
         url = UPSTREAM_BASE + self.path
         headers = {k: v for k, v in self.headers.items() if k.lower() not in FORBIDDEN_HEADERS}
@@ -287,15 +325,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 j = json.loads(body)
                 msgs = j.get("messages")
                 if isinstance(msgs, list) and msgs:
-                    sys_idx = next((i for i, m in enumerate(msgs)
-                                    if isinstance(m, dict) and m.get("role") == "system"), None)
-                    if sys_idx is None:
-                        msgs.insert(0, {"role": "system", "content": SYSTEM_MARKER})
+                    has_multimodal = False
+                    for m in msgs:
+                        if isinstance(m, dict) and isinstance(m.get("content"), list):
+                            has_multimodal = True
+                            break
+                    if has_multimodal:
+                        log.info(f"Skipping SPOOF_SYSTEM_MARKER: multimodal content detected")
                     else:
-                        c = msgs[sys_idx].get("content")
-                        if isinstance(c, str) and "you are opencode" not in c.lower():
-                            msgs[sys_idx]["content"] = SYSTEM_MARKER + " " + c
-                    body = json.dumps(j).encode()
+                        sys_idx = next((i for i, m in enumerate(msgs)
+                                        if isinstance(m, dict) and m.get("role") == "system"), None)
+                        if sys_idx is None:
+                            msgs.insert(0, {"role": "system", "content": SYSTEM_MARKER})
+                        else:
+                            c = msgs[sys_idx].get("content")
+                            if isinstance(c, str) and "you are opencode" not in c.lower():
+                                msgs[sys_idx]["content"] = SYSTEM_MARKER + " " + c
+                        body = json.dumps(j).encode()
             except Exception:
                 pass
 
@@ -306,23 +352,27 @@ class ProxyHandler(BaseHTTPRequestHandler):
             try:
                 resp = self.attempt(method, url, body, headers, proxy)
 
-                if resp.status_code != 429:
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    if resp.status_code == 429:
+                        wait = retry_after_seconds(resp, min(RETRY_BACKOFF * (attempt + 1), MAX_BACKOFF))
+                        log.warning(f"429 for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
+                    else:
+                        wait = min(RETRY_BACKOFF * (attempt + 1), MAX_BACKOFF)
+                        log.warning(f"{resp.status_code} for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
+                    resp.close()
+
+                    if ROTATE_ON_429:
+                        rotated = renew_tor_ip()
+                        if rotated:
+                            continue
+                        log.warning("IP rotation failed, waiting before retry")
+
+                    if attempt < RETRY_ATTEMPTS - 1:
+                        time.sleep(wait)
+                else:
                     log.info(f"Response: {resp.status_code} for {self.path} model={current_model}")
                     self.passthrough(resp)
                     return
-
-                wait = retry_after_seconds(resp, min(RETRY_BACKOFF * (attempt + 1), MAX_BACKOFF))
-                log.warning(f"429 for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
-                resp.close()
-
-                if ROTATE_ON_429:
-                    rotated = renew_tor_ip()
-                    if rotated:
-                        continue
-                    log.warning("IP rotation failed on 429, waiting before retry")
-
-                if attempt < RETRY_ATTEMPTS - 1:
-                    time.sleep(wait)
 
             except requests.exceptions.Timeout:
                 log.error(f"Timeout for {method} {self.path}")
@@ -363,17 +413,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 fb_body = swap_model(body, fb)
                 if fb_body is None:
                     continue
-                log.warning(f"429 exhausted for model={current_model}, falling back to model={fb}")
+                log.warning(f"Retries exhausted for model={current_model}, falling back to model={fb}")
                 for attempt in range(2):
                     proxy = get_proxy()
                     try:
                         resp = self.attempt(method, url, fb_body, headers, proxy)
-                        if resp.status_code != 429:
+                        if resp.status_code < 429:
                             log.info(f"Fallback {fb} -> {resp.status_code} for {self.path}")
                             self.passthrough(resp)
                             return
                         wait = retry_after_seconds(resp, 10)
-                        log.warning(f"Fallback {fb} 429 attempt={attempt+1} retry_in={wait}s")
+                        log.warning(f"Fallback {fb} {resp.status_code} attempt={attempt+1} retry_in={wait}s")
                         resp.close()
                         if attempt == 0:
                             time.sleep(wait)
@@ -381,8 +431,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         log.error(f"Fallback {fb} error: {e}")
                         break
 
-        log.error(f"429 for {self.path} persists for model={current_model}, returning 429")
-        self.send_429()
+        log.error(f"Retries exhausted for {self.path} model={current_model}, returning 503")
+        self.send_error(503, f"All retries exhausted for model={current_model}")
 
 
 def main():

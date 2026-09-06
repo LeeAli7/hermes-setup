@@ -23,6 +23,7 @@ CONTROL_PORT = 9051
 SOCKS_PORT = 9050
 UPSTREAM_READ_TIMEOUT = 300
 UPSTREAM_CONNECT_TIMEOUT = 60
+MAX_BODY_SIZE = int(os.environ.get("FORWARDER_MAX_BODY", str(20 * 1024 * 1024)))  # 20MB
 
 RETRY_ATTEMPTS = int(os.environ.get("FORWARDER_429_ATTEMPTS", "4"))
 RETRY_BACKOFF = float(os.environ.get("FORWARDER_429_BACKOFF", "8"))
@@ -218,9 +219,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def handle_request(self, method):
         content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > MAX_BODY_SIZE:
+            log.warning(f"Body too large: {content_length} bytes (max {MAX_BODY_SIZE})")
+            self.send_error(413, f"Request body too large: {content_length} bytes")
+            return
         body = None
         if content_length > 0:
             body = self.rfile.read(content_length)
+            log.info(f"Body read: {len(body)} bytes for {method} {self.path}")
+        # NB: тело НЕ мутируем (нет SPOOF-блока) — vision/multimodal проходит как есть.
 
         url = UPSTREAM_BASE + self.path
         headers = {k: v for k, v in self.headers.items() if k.lower() not in FORBIDDEN_HEADERS}
@@ -239,23 +246,27 @@ class ProxyHandler(BaseHTTPRequestHandler):
             try:
                 resp = self.attempt(method, url, body, headers, proxy)
 
-                if resp.status_code != 429:
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    if resp.status_code == 429:
+                        wait = retry_after_seconds(resp, min(RETRY_BACKOFF * (attempt + 1), MAX_BACKOFF))
+                        log.warning(f"429 for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
+                    else:
+                        wait = min(RETRY_BACKOFF * (attempt + 1), MAX_BACKOFF)
+                        log.warning(f"{resp.status_code} for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
+                    resp.close()
+
+                    if ROTATE_ON_429:
+                        rotated = renew_tor_ip()
+                        if rotated:
+                            continue
+                        log.warning("IP rotation failed, waiting before retry")
+
+                    if attempt < RETRY_ATTEMPTS - 1:
+                        time.sleep(wait)
+                else:
                     log.info(f"Response: {resp.status_code} for {self.path} model={current_model}")
                     self.passthrough(resp)
                     return
-
-                wait = retry_after_seconds(resp, min(RETRY_BACKOFF * (attempt + 1), MAX_BACKOFF))
-                log.warning(f"429 for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
-                resp.close()
-
-                if ROTATE_ON_429:
-                    rotated = renew_tor_ip()
-                    if rotated:
-                        continue
-                    log.warning("IP rotation failed on 429, waiting before retry")
-
-                if attempt < RETRY_ATTEMPTS - 1:
-                    time.sleep(wait)
 
             except requests.exceptions.Timeout:
                 log.error(f"Timeout for {method} {self.path}")
@@ -296,17 +307,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 fb_body = swap_model(body, fb)
                 if fb_body is None:
                     continue
-                log.warning(f"429 exhausted for model={current_model}, falling back to model={fb}")
+                log.warning(f"Retries exhausted for model={current_model}, falling back to model={fb}")
                 for attempt in range(2):
                     proxy = get_proxy()
                     try:
                         resp = self.attempt(method, url, fb_body, headers, proxy)
-                        if resp.status_code != 429:
+                        if resp.status_code < 429:
                             log.info(f"Fallback {fb} -> {resp.status_code} for {self.path}")
                             self.passthrough(resp)
                             return
                         wait = retry_after_seconds(resp, 10)
-                        log.warning(f"Fallback {fb} 429 attempt={attempt+1} retry_in={wait}s")
+                        log.warning(f"Fallback {fb} {resp.status_code} attempt={attempt+1} retry_in={wait}s")
                         resp.close()
                         if attempt == 0:
                             time.sleep(wait)
@@ -314,8 +325,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         log.error(f"Fallback {fb} error: {e}")
                         break
 
-        log.error(f"429 for {self.path} persists for model={current_model}, returning 429")
-        self.send_429()
+        log.error(f"Retries exhausted for {self.path} model={current_model}, returning 503")
+        self.send_error(503, f"All retries exhausted for model={current_model}")
 
 
 def main():

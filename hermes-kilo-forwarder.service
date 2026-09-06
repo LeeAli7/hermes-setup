@@ -4,9 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=ali
-WorkingDirectory=/home/ali/projects/hermes
-ExecStart=/home/ali/.hermes/hermes-agent/venv/bin/python3 /home/ali/projects/hermes/kilo_forwarder.py 9001
+WorkingDirectory=%h/projects/hermes
+ExecStart=%h/.hermes/hermes-agent/venv/bin/python3 %h/projects/hermes/kilo_forwarder.py 9001
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1

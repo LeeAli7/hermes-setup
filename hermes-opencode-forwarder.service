@@ -1,0 +1,12 @@
+[Unit]
+Description=Hermes OpenCode Forwarder (opencode.ai via Tor)
+After=network.target
+
+[Service]
+ExecStart=%h/.hermes/hermes-agent/venv/bin/python3 %h/projects/hermes/forwarder.py 9000
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
