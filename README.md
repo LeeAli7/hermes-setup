@@ -1,178 +1,117 @@
-# QwenMode
+# hermes-setup
 
-OpenAI-compatible API server that routes requests through **chat.qwen.ai** (Qwen3.8-Max-Preview) using Playwright headless browser automation.
+Scripts and configs for running Hermes AI agent with free-tier LLM providers (opencode.ai, kilo.ai) via local proxy forwarder.
 
-## How It Works
+## Problem
 
-QwenMode launches a headless Chromium browser pointing to chat.qwen.ai, intercepts SSE responses from the `/api/v2/chat/completions` endpoint, parses them into OpenAI-compatible responses, and supports tool calls with robust JSON extraction including snake_case-to-camelCase mapping.
+opencode.ai free tier enforces request-level protections that block anonymous/non-official clients:
+
+1. **User-Agent whitelist** — only `opencode/...` User-Agent accepted
+2. **System prompt marker** — response must contain "You are opencode"
+3. **MissingSessionID** — requests without `x-opencode-session`, `x-opencode-client`, `x-opencode-request`, `x-opencode-project` headers are rejected
+4. **Rate limits (429)** — per-IP quotas, mitigated by Tor IP rotation
+5. **Model-specific API routing** — `muse-spark-1.3-contributor-free` only works via `/v1/responses` (Responses API), not `/v1/chat/completions` (Chat Completions API)
+
+Without these headers, opencode.ai returns `MissingSessionID` or 403. The `muse-spark` models additionally return 500 if sent through the standard Chat Completions endpoint.
+
+## How it works
 
 ```
-Client (opencode, curl, etc.) -> QwenMode :5002 -> Playwright -> chat.qwen.ai
+hermes-agent -> forwarder.py :9000 -> opencode.ai (with spoofed headers + Responses API conversion)
 ```
 
-## Requirements
+The forwarder (`forwarder.py`) does three things:
+1. **Injects official opencode headers** — session ID, client ID, request ID, project ID (extracted from reverse-engineering the opencode CLI binary)
+2. **Converts Chat Completions → Responses API** — for `muse-spark-*` models, converts the OpenAI-format request to opencode's Responses API format and back
+3. **Tor IP rotation** — rotates exit node on 429 to bypass per-IP quotas
 
-- Python 3.10+
-- Chromium (installed by Playwright)
+## Supported models
 
-## Installation
+### opencode.ai (free, via Responses API conversion)
+| Model | Endpoint | Status |
+|-------|----------|--------|
+| `muse-spark-1.3-contributor-free` | `/v1/responses` | Working |
+| `muse-spark-1.2-contributor-free` | `/v1/responses` | Working |
+| `mimo-v2.5-free` | `/v1/chat/completions` | Working |
+
+### opencode.ai (free, Chat Completions)
+| Model | Status |
+|-------|--------|
+| `grok-4-1-free` | Working |
+| `qwen3-coder-free` | Working |
+| `glm-5-free` | Working |
+| `minimax-m2.5-free` | Working |
+
+### kilo.ai (free, no Tor needed)
+| Model | Status |
+|-------|--------|
+| `Llama-3.3-70B-Instruct` | Working |
+| `Llama-3.1-8B-Instruct` | Working |
+| `Mistral-Small-3.1-24B-Instruct-2503` | Working |
+| `DeepSeek-V3-0324` | Working |
+| `Qwen3-235B-A22B` | Working |
+| + 14 more models | See `switch.sh` |
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `forwarder.py` | Local proxy: header injection, Responses API conversion, Tor rotation |
+| `proxy_manager.py` | Tor service management, IP rotation |
+| `switch.sh` | Interactive provider/model switcher |
+| `config.yaml` | Hermes agent config (model, provider, base_url) |
+| `hermes-opencode-forwarder.service` | systemd unit for forwarder |
+| `provider-restore.sh` | Boot-time provider state restoration |
+
+## Setup
 
 ```bash
-# 1. Clone
-git clone https://github.com/LeeAli7/qwenmode.git
-cd qwenmode
+# Install dependencies
+sudo apt install tor
+pip install requests pysocks
 
-# 2. Create virtual environment (optional but recommended)
-python3 -m venv venv
-source venv/bin/activate
+# Start Tor
+sudo systemctl start tor
 
-# 3. Install dependencies
-pip install -r requirements.txt
+# Start forwarder
+python3 forwarder.py 9000
 
-# 4. Install Playwright Chromium
-playwright install chromium
+# Or install as systemd service
+sudo cp hermes-opencode-forwarder.service /etc/systemd/system/
+sudo systemctl enable --now hermes-opencode-forwarder@ali
 ```
 
-## Usage
+## Why these changes were made
+
+### 1. MissingSessionID bypass (headers)
+opencode.ai added session validation. Without `x-opencode-session` header, requests fail with `MissingSessionID`. We reverse-engineered the opencode CLI binary (`~/.opencode/bin/opencode`) and extracted the required headers:
+- `x-opencode-session` — random UUID per request
+- `x-opencode-client` — client version (always `1`)
+- `x-opencode-request` — random UUID per request
+- `x-opencode-project` — random UUID per request
+
+### 2. Responses API conversion (muse-spark models)
+`muse-spark-1.3-contributor-free` and `muse-spark-1.2-contributor-free` do not support the Chat Completions API (`/v1/chat/completions`). They only work through opencode's Responses API (`/v1/responses`). The forwarder automatically detects these models and converts:
+- Request: `messages[]` → `input[]`
+- Response: `output[].content[].text` → `choices[].message.content`
+
+### 3. Tor rotation on 429
+opencode.ai enforces per-IP quotas. When a 429 is received, the forwarder rotates the Tor exit node to get a fresh IP. This is done via `proxy_manager.py` which sends a `NEWNYM` signal to Tor's control port.
+
+## Troubleshooting
 
 ```bash
-# Default port 5002
-python qwenmode.py --server
+# Check forwarder logs
+tail -f /home/ali/projects/hermes/logs/forwarder.log
 
-# Custom port
-python qwenmode.py --server 5002
-```
-
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/chat/completions` | OpenAI-compatible chat completion |
-| GET | `/v1/models` | List available models |
-| GET | `/health` | Health check |
-| GET | `/debug` | Browser page DOM diagnostics |
-| GET | `/log` | Last request details |
-
-### Quick test
-
-```bash
-curl http://127.0.0.1:5002/health
-curl http://127.0.0.1:5002/v1/models
-
-curl http://127.0.0.1:5002/v1/chat/completions \
+# Test direct to forwarder
+curl http://127.0.0.1:9000/zen/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3.8-Max-Preview",
-    "messages": [{"role": "user", "content": "Say hello"}]
-  }'
+  -d '{"model":"muse-spark-1.3-contributor-free","messages":[{"role":"user","content":"hi"}]}'
+
+# Rotate Tor IP manually
+python3 -c "from proxy_manager import renew_tor_ip; renew_tor_ip()"
+
+# Check current provider state
+cat ~/.config/hermes-switch.state
 ```
-
-### With tool calls
-
-```bash
-curl http://127.0.0.1:5002/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3.8-Max-Preview",
-    "messages": [{"role": "user", "content": "Read file /etc/hostname"}],
-    "tools": [{
-      "function": {
-        "name": "read",
-        "description": "Read a file from disk",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "filePath": {"type": "string"}
-          },
-          "required": ["filePath"]
-        }
-      }
-    }]
-  }'
-```
-
-## Configuration
-
-All settings are read from environment variables (`QWENMODE_*`), with `qwenmode.py` defaults:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `QWENMODE_URL` | `https://chat.qwen.ai` | Target chat URL |
-| `QWENMODE_API_KEY` | (empty) | If set, requests must send it via `Authorization: Bearer` |
-| `QWENMODE_POOL_SIZE` | `1` | Number of concurrent browser pages |
-| `QWENMODE_SSE_TIMEOUT` | `90` | SSE response wait timeout (seconds) |
-| `QWENMODE_EMPTY_NO_SSE` | `30` | Abort as EMPTY if no SSE POST observed within Ns (silent dead send) |
-| `QWENMODE_EMPTY_RETRY_BUDGET` | `180` | Total retry budget (s) for EMPTY/dead-send attempts; `0` disables retries |
-| `QWENMODE_GUEST_ROTATE_EVERY` | `3` | Rotate to a fresh guest profile every N requests |
-| `QWENMODE_GUEST_COOLDOWN` | `5` | Pause (s) before reusing a rotated page |
-| `QWENMODE_NO_PAGE_TIMEOUT` | `20` | Max wait (s) for an idle page before failing |
-
-## Guest Mode
-
-By default QwenMode runs in **guest mode**: it rotates through fresh incognito guest profiles (default every 3 requests) so daily rate limits and auth prompts are avoided. No `cookies.json` is needed anymore. For an authenticated persistent session, set `QWENMODE_GUEST_MODE=0` and place a `cookies.json` export locally (file is git-ignored).
-
-## opencode Integration
-
-Add to `~/.config/opencode/opencode.json`:
-
-```json
-{
-  "provider": {
-    "qwenmode": {
-      "name": "QwenMode",
-      "npm": "@ai-sdk/openai-compatible",
-      "env": ["QWENMODE_API_KEY"],
-      "options": {
-        "apiKey": "public",
-        "baseURL": "http://127.0.0.1:5002/v1",
-        "timeout": 300000
-      },
-      "models": {
-        "Qwen3.8-Max-Preview": {
-          "id": "Qwen3.8-Max-Preview",
-          "name": "Qwen3.8-Max-Preview",
-          "tool_call": true,
-          "reasoning": true,
-          "limit": { "context": 128000, "output": 4096 },
-          "cost": { "input": 0, "output": 0 }
-        }
-      }
-    }
-  }
-}
-```
-
-## Linux Service (systemd)
-
-Create `/etc/systemd/system/qwenmode.service`:
-
-```ini
-[Unit]
-Description=QwenMode API Server
-After=network.target
-
-[Service]
-Type=simple
-User=youruser
-WorkingDirectory=/path/to/qwenmode
-ExecStart=/path/to/qwenmode/venv/bin/python qwenmode.py --server 5002
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now qwenmode
-sudo systemctl status qwenmode
-```
-
-## Notes
-
-- The browser profile directory is cleaned on each restart for a fresh session
-- Guest mode rotates fresh incognito profiles to dodge daily rate limits and login prompts
-- EMPTY/silent-dead-send detections abort fast and retry within `QWENMODE_EMPTY_RETRY_BUDGET`
-- Quota/overload ("high demand") errors rotate to a fresh guest instead of retrying the same page
-- Tool call responses support snake_case (`file_path`, `old_text`) and camelCase parameter names
