@@ -279,6 +279,45 @@ class ProxyHandler(BaseHTTPRequestHandler):
         finally:
             resp.close()
 
+    def convert_responses_to_chat(self, resp):
+        try:
+            data = resp.json()
+            content_parts = []
+            for item in data.get("output", []):
+                if item.get("type") == "message":
+                    for part in item.get("content", []):
+                        if part.get("type") == "output_text":
+                            content_parts.append(part.get("text", ""))
+            text = "\n".join(content_parts) if content_parts else ""
+            chat_resp = {
+                "id": data.get("id", ""),
+                "object": "chat.completion",
+                "created": data.get("created_at", 0),
+                "model": data.get("model", ""),
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": text}
+                }],
+                "usage": {
+                    "prompt_tokens": data.get("usage", {}).get("input_tokens", 0),
+                    "completion_tokens": data.get("usage", {}).get("output_tokens", 0),
+                    "total_tokens": data.get("usage", {}).get("total_tokens", 0),
+                }
+            }
+            out = json.dumps(chat_resp).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            self.wfile.flush()
+        except Exception as e:
+            log.error(f"convert_responses_to_chat error: {e}")
+            self.passthrough(resp)
+        finally:
+            resp.close()
+
     def send_429(self, message="Rate limit exceeded after retries. Please try again later."):
         try:
             self.send_response(429)
@@ -312,11 +351,53 @@ class ProxyHandler(BaseHTTPRequestHandler):
         url = UPSTREAM_BASE + self.path
         headers = {k: v for k, v in self.headers.items() if k.lower() not in FORBIDDEN_HEADERS}
         headers["User-Agent"] = UPSTREAM_UA
+        headers["x-opencode-session"] = str(uuid.uuid4())
+        headers["x-opencode-client"] = "1"
+        headers["x-opencode-request"] = str(uuid.uuid4())
+        headers["x-opencode-project"] = str(uuid.uuid4())
 
         current_model = None
         if body:
             try:
                 current_model = json.loads(body).get("model")
+            except Exception:
+                current_model = None
+
+        RESPONSES_MODELS = {"muse-spark-1.3-contributor-free", "muse-spark-1.2-contributor-free"}
+        use_responses_api = (
+            current_model in RESPONSES_MODELS
+            and "/chat/completions" in self.path
+        )
+        if use_responses_api:
+            try:
+                chat = json.loads(body)
+                resp_input = []
+                for msg in chat.get("messages", []):
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        parts = []
+                        for c in content:
+                            if isinstance(c, dict) and c.get("type") == "text":
+                                parts.append(c.get("text", ""))
+                            elif isinstance(c, str):
+                                parts.append(c)
+                        content = "\n".join(parts) if parts else str(content)
+                    resp_input.append({"role": role, "content": str(content)})
+                responses_body = {
+                    "model": current_model,
+                    "input": resp_input,
+                    "stream": chat.get("stream", False),
+                }
+                if "temperature" in chat:
+                    responses_body["temperature"] = chat["temperature"]
+                if "max_tokens" in chat:
+                    responses_body["max_output_tokens"] = chat["max_tokens"]
+                body = json.dumps(responses_body).encode()
+                url = UPSTREAM_BASE + "/zen/v1/responses"
+                log.info(f"Converted chat/completions -> responses API for model={current_model}")
+            except Exception as e:
+                log.warning(f"Failed to convert to responses API: {e}")
             except Exception:
                 current_model = None
 
@@ -371,7 +452,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         time.sleep(wait)
                 else:
                     log.info(f"Response: {resp.status_code} for {self.path} model={current_model}")
-                    self.passthrough(resp)
+                    if use_responses_api and resp.status_code == 200:
+                        self.convert_responses_to_chat(resp)
+                    else:
+                        self.passthrough(resp)
                     return
 
             except requests.exceptions.Timeout:
