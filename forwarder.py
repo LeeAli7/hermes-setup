@@ -1,4 +1,4 @@
-import json, os, sys, logging, threading, time, socket, binascii
+import json, os, sys, logging, threading, time, socket, binascii, uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import requests, urllib3
@@ -398,7 +398,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 log.info(f"Converted chat/completions -> responses API for model={current_model}")
             except Exception as e:
                 log.warning(f"Failed to convert to responses API: {e}")
-            except Exception:
                 current_model = None
 
         if body and SPOOF_SYSTEM_MARKER:
