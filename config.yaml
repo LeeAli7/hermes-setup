@@ -1,5 +1,5 @@
 model:
-  default: deepseek-v4-flash-free
+  default: muse-spark-1.3-contributor-free
   provider: opencode-zen
   base_url: http://127.0.0.1:9000/zen/v1
 provider: opencode-zen

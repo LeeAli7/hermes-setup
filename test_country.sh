@@ -23,7 +23,7 @@ get_exit_info() {
 test_api() {
   curl -s -o /dev/null -w "%{http_code}" --max-time 90 -X POST http://127.0.0.1:9000/zen/v1/chat/completions \
     -H "Content-Type: application/json" \
-    -d '{"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"hi"}],"max_tokens":5,"stream":false}'
+    -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"hi"}],"max_tokens":5,"stream":false}'
 }
 
 for cc in "$@"; do

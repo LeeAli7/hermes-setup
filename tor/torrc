@@ -6,5 +6,5 @@ GeoIPFile /usr/share/tor/geoip
 GeoIPv6File /usr/share/tor/geoip6
 SafeLogging 1
 Log notice file /home/ali/projects/hermes/tor/tor.log
-ExitNodes {de},{fr},{us},{nl},{gb},{ro},{ch},{se},{pl},{at},{es},{it},{ca},{no},{fi},{be},{cz}
-StrictNodes 1
+ExitNodes {us},{de},{fr},{gb},{nl},{se},{ch},{at},{be},{cz},{es},{it},{ca},{no},{fi},{pl},{ro},{ie},{pt},{au},{nz},{jp},{kr},{br},{mx},{ar},{cl},{co},{za},{ng},{eg},{il},{ae},{sg},{hk},{tw},{th},{ph},{my},{id},{vn},{pk},{bd},{ua},{by},{rs},{bg},{hr},{sk},{si},{lt},{lv},{ee},{dk},{is},{lu},{mt},{cy},{ge},{am},{kz},{uz},{kg},{tj},{tm},{mn},{kg},{la},{kh},{mm},{bn},{np},{lk},{mv},{fj},{pg},{nz}
+StrictNodes 0

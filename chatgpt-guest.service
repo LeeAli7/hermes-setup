@@ -1,0 +1,21 @@
+[Unit]
+Description=ChatGPT Guest Proxy (chatgpt.com guest mode, no account)
+After=network-online.target
+# chromium lives on /mnt/samsung500 (symlinked cache) — wait for the HDD mount,
+# otherwise boot-time starts crash-loop on "executable doesn't exist"
+RequiresMountsFor=/mnt/samsung500
+
+[Service]
+Type=simple
+User=ali
+WorkingDirectory=/home/ali/projects/hermes
+ExecStartPre=/bin/sh -c 'for i in $$(seq 1 90); do [ -x /home/ali/.cache/ms-playwright/chromium-1228/chrome-linux64/chrome ] && exit 0; sleep 2; done; echo "chromium binary not available" >&2; exit 1'
+ExecStart=/home/ali/projects/hermes/venv/bin/python /home/ali/projects/hermes/chatgpt_guest.py --server 5003
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+Environment=CG_PROFILE_DIR=/tmp/chatgpt_guest_profile
+Environment=CG_POOL_SIZE=2
+
+[Install]
+WantedBy=default.target
