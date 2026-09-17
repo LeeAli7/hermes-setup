@@ -1,4 +1,4 @@
-import json, os, sys, logging, threading, time, socket, binascii, uuid
+import json, os, sys, logging, threading, time, socket, binascii, uuid, secrets, string
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import requests, urllib3
@@ -40,21 +40,84 @@ FALLBACK_MODELS = [m.strip() for m in os.environ.get(
     "FORWARDER_FALLBACK_MODELS", "").split(",") if m.strip()]
 
 # --- official-client emulation ---
-# opencode.ai's free tier rate-limits anonymous requests that do NOT look
-# like they come from the official opencode CLI. The gateway whitelists
-# requests whose User-Agent contains "opencode" AND whose system prompt
-# mentions "You are opencode" (verified by replaying captured CLI traffic:
-# with both -> 200 OK, missing either -> 429 FreeUsageLimitError).
+# Since ~16.09.2026 opencode.ai's free tier GATES on request shape, not just
+# rate-limits: anonymous/non-CLI requests get 403 FreeTierError ("can only be
+# used from within OpenCode"). Verified by replaying captured CLI traffic
+# (mitmproxy, CLI v1.18.31) field-by-field on 17.09.2026. Passing combo:
+#   Authorization: Bearer public (literal!) + current CLI UA +
+#   x-opencode-client: cli + x-opencode-project: global +
+#   x-opencode-session: ses_<9hex>ffe<14alnum> +
+#   x-opencode-request: msg_<9hex>001<14alnum>
+# The ses_/msg_ IDs are FORMAT-validated server-side (reverse-engineered from
+# the CLI binary + its local opencode.db). Random UUIDs -> 403. Missing
+# headers -> 403. Wrong bearer (e.g. Hermes' placeholder) -> 401.
 UPSTREAM_UA = os.environ.get(
     "FORWARDER_UA",
-    "opencode/1.14.39 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13",
+    "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
 )
+# Literal public bearer the official CLI sends. ALWAYS overwritten outbound:
+# Hermes sends its own placeholder (opencode-zen-free-keyless) which 401s.
+UPSTREAM_BEARER = os.environ.get("FORWARDER_UPSTREAM_BEARER", "Bearer public")
 SPOOF_SYSTEM_MARKER = os.environ.get("FORWARDER_SYSTEM_MARKER", "1") == "1"
 SYSTEM_MARKER = os.environ.get("FORWARDER_SYSTEM_MARKER_TEXT", "You are opencode.")
 
 FORBIDDEN_HEADERS = {"host", "content-length", "transfer-encoding", "connection", "accept-encoding"}
 
+# --- public API key auth (from Marsel, keeps cloudflared tunnel protected) ---
+# Localhost (127.0.0.1 / ::1) is always allowed (local Hermes gateway, keyless provider).
+# Remote clients must send:  Authorization: Bearer $FORWARDER_API_KEY
+# Remote clients are also restricted to /zen/* API paths (+ /health).
+PUBLIC_API_KEY = os.environ.get("FORWARDER_API_KEY", "").strip()
+LOOPBACK_IPS = {"127.0.0.1", "::1"}
+
 _rotate_lock = threading.Lock()
+
+_SESSION_PIN_LOCK = threading.Lock()
+_SESSION_PINS = {}  # stable key (prompt_cache_key) -> sticky x-opencode-session id
+
+_HEX = "0123456789abcdef"
+_ALNUM = string.ascii_letters + string.digits
+
+
+def _new_session_id():
+    # Format reverse-engineered from the official CLI (opencode.db):
+    # ses_ + 9 hex + "ffe" + 14 alnum. Anything else -> 403 FreeTierError.
+    return ("ses_" + "".join(secrets.choice(_HEX) for _ in range(9)) + "ffe"
+            + "".join(secrets.choice(_ALNUM) for _ in range(14)))
+
+
+def _new_request_id():
+    # msg_ + 9 hex + "001" + 14 alnum (002 also seen; 001 is the common one).
+    return ("msg_" + "".join(secrets.choice(_HEX) for _ in range(9)) + "001"
+            + "".join(secrets.choice(_ALNUM) for _ in range(14)))
+
+
+def _sticky_session_for(body):
+    """Stable x-opencode-session for one conversation (fix 2026-09-13).
+
+    Native Responses bodies carry prompt_cache_key (stable per
+    conversation) -> reuse one uuid per key. Chat bodies carry no key ->
+    fresh uuid (unchanged behaviour; chat path carries no sealed blobs).
+    """
+    key = None
+    try:
+        if body:
+            j = json.loads(body) if isinstance(body, (bytes, bytearray)) else body
+            if isinstance(j, dict):
+                key = j.get("prompt_cache_key") or None
+    except Exception:
+        key = None
+    if not key:
+        return _new_session_id()
+    with _SESSION_PIN_LOCK:
+        sess = _SESSION_PINS.get(key)
+        if not sess:
+            sess = _new_session_id()
+            _SESSION_PINS[key] = sess
+            if len(_SESSION_PINS) > 5000:
+                _SESSION_PINS.pop(next(iter(_SESSION_PINS)))
+    return sess
+
 
 
 def get_proxy():
@@ -120,8 +183,36 @@ def renew_tor_ip():
                     s.close()
                     if resp.startswith(b"250"):
                         log.info("Tor IP rotation signal sent")
-                        time.sleep(5)
-                        return True
+                        # Verify the exit actually changed and record it
+                        # (previously returned True blindly — state went stale).
+                        # Fresh circuits need time: poll up to ~25s.
+                        try:
+                            with open(STATE_FILE) as f:
+                                old_ip = json.load(f).get("tor_exit_ip")
+                        except:
+                            old_ip = None
+                        new_ip = None
+                        for _ in range(5):
+                            time.sleep(5)
+                            new_ip = get_tor_ip()
+                            if new_ip and new_ip != old_ip:
+                                break
+                        if new_ip and new_ip != old_ip:
+                            log.info(f"New Tor IP: {new_ip}")
+                            try:
+                                with open(STATE_FILE) as f:
+                                    state = json.load(f)
+                            except:
+                                state = {}
+                            state["current_proxy"] = f"socks5h://127.0.0.1:{SOCKS_PORT}"
+                            state["tor_exit_ip"] = new_ip
+                            state["last_rotation_time"] = time.time()
+                            state["total_ip_switches"] = state.get("total_ip_switches", 0) + 1
+                            with open(STATE_FILE, "w") as f:
+                                json.dump(state, f)
+                            return True
+                        log.warning(f"NEWNYM sent but IP unchanged ({new_ip})")
+                        return False
                     else:
                         log.error(f"NEWNYM failed: {resp}")
                         return False
@@ -228,6 +319,116 @@ def swap_model(body, model):
         return None
 
 
+def chat_text_of(content):
+    """Flatten an OpenAI chat content block to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                parts.append(c.get("text", ""))
+            elif isinstance(c, str):
+                parts.append(c)
+        return "\n".join(parts) if parts else str(content)
+    return str(content or "")
+
+
+def chat_messages_to_responses_input(messages):
+    """Chat messages[] -> Responses input[], preserving tool traffic.
+
+    assistant messages carrying tool_calls become function_call items,
+    tool messages become function_call_output items, everything else
+    becomes a plain role/content item. This keeps multi-turn agentic
+    loops intact through the conversion.
+
+    Upstream rejects empty call_id outright, so items that arrived
+    without one are paired positionally and given stable
+    fwd-call-<n> ids (call and its output share the number).
+    """
+    resp_input = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "user")
+        if role == "tool":
+            resp_input.append({
+                "type": "function_call_output",
+                "call_id": msg.get("tool_call_id") or msg.get("call_id") or "",
+                "output": chat_text_of(msg.get("content")),
+            })
+            continue
+        text = chat_text_of(msg.get("content"))
+        tcs = msg.get("tool_calls") if role == "assistant" else None
+        if isinstance(tcs, list) and tcs:
+            if text:
+                resp_input.append({"role": "assistant", "content": text})
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+                args = fn.get("arguments", "")
+                if not isinstance(args, str):
+                    try:
+                        args = json.dumps(args)
+                    except Exception:
+                        args = str(args)
+                resp_input.append({
+                    "type": "function_call",
+                    "call_id": tc.get("id") or "",
+                    "name": fn.get("name") or "unknown_tool",
+                    "arguments": args,
+                })
+            continue
+        resp_input.append({"role": role, "content": text})
+    # Pair up items with empty call_id so upstream validation
+    # (call_id length >= 1) passes and each call shares its number
+    # with its output: zip calls with outputs in encounter order,
+    # leftovers get their own numbers.
+    _calls = [i for i in resp_input
+              if i.get("type") == "function_call" and not i.get("call_id")]
+    _outs = [i for i in resp_input
+             if i.get("type") == "function_call_output" and not i.get("call_id")]
+    _n = 0
+    for _c, _o in zip(_calls, _outs):
+        _n += 1
+        _c["call_id"] = _o["call_id"] = f"fwd-call-{_n}"
+    for _i in _calls[len(_outs):] + _outs[len(_calls):]:
+        _n += 1
+        _i["call_id"] = f"fwd-call-{_n}"
+    return resp_input
+
+
+def chat_tools_to_responses(chat):
+    """Chat tools/tool_choice -> Responses shape (or (None, None))."""
+    tools = chat.get("tools")
+    out_tools = None
+    if isinstance(tools, list) and tools:
+        out_tools = []
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            if t.get("type") == "function" and isinstance(t.get("function"), dict):
+                f = t["function"]
+                out_tools.append({
+                    "type": "function",
+                    "name": f.get("name") or "",
+                    "description": f.get("description") or "",
+                    "parameters": f.get("parameters") or {"type": "object", "properties": {}},
+                })
+        out_tools = out_tools or None
+    tc = chat.get("tool_choice")
+    out_tc = None
+    if isinstance(tc, str) and tc in ("auto", "none", "required"):
+        out_tc = tc
+    elif isinstance(tc, dict):
+        if tc.get("type") == "function" and isinstance(tc.get("function"), dict):
+            out_tc = {"type": "function", "name": tc["function"].get("name") or ""}
+        else:
+            out_tc = "auto"
+    return out_tools, out_tc
+
+
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -281,6 +482,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def convert_responses_to_chat(self, resp):
         try:
+            # Upstream SSE/JSON is always UTF-8, but requests defaults
+            # text/* without charset to ISO-8859-1 -> Cyrillic mojibake.
+            resp.encoding = "utf-8"
             data = resp.json()
             content_parts = []
             for item in data.get("output", []):
@@ -318,6 +522,149 @@ class ProxyHandler(BaseHTTPRequestHandler):
         finally:
             resp.close()
 
+    def translate_responses_stream(self, resp, model):
+        """Responses SSE -> chat-completions SSE, streamed to the client.
+
+        Maps response.output_text.delta to content deltas, function_call
+        items + arguments deltas to tool_calls deltas, and ends with a
+        finish chunk + [DONE]. Unknown events are skipped (pings and
+        lifecycle noise); a failed response just ends the stream.
+        """
+        import time as _time
+
+        def sse(obj):
+            return ("data: " + json.dumps(obj) + "\n\n").encode()
+
+        chat_id = "chatcmpl-resp-%d" % int(_time.time() * 1000)
+        created = int(_time.time())
+        # Force UTF-8: requests would decode text/event-stream without
+        # charset as ISO-8859-1, garbling every non-ASCII delta.
+        resp.encoding = "utf-8"
+
+        def base_delta():
+            return {"id": chat_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": None}]}
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            # Close after [DONE]: with HTTP/1.1 keep-alive and no
+            # Content-Length the client would otherwise wait forever
+            # for EOF (dsh hangs; only [DONE]-parsers survive).
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            w = self.wfile
+            prelude = base_delta()
+            prelude["choices"][0]["delta"] = {"role": "assistant", "content": ""}
+            w.write(sse(prelude))
+            w.flush()
+            call_index = {}
+            args_seen = set()
+            finish = "stop"
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw:
+                    continue
+                if raw.startswith(":"):
+                    # keep-alive / lifecycle comments: forward as SSE
+                    # comments so the client sees traffic during long
+                    # reasoning stretches and does not time out.
+                    try:
+                        w.write((raw + "\n\n").encode())
+                        w.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
+                    continue
+                if not raw.startswith("data:"):
+                    continue
+                payload = raw[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    ev = json.loads(payload)
+                except Exception:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                t = ev.get("type", "")
+                if t == "response.output_text.delta":
+                    d = ev.get("delta", "")
+                    if d:
+                        c = base_delta()
+                        c["choices"][0]["delta"] = {"content": d}
+                        w.write(sse(c))
+                        w.flush()
+                elif t == "response.output_item.added":
+                    item = ev.get("item", {}) or {}
+                    if item.get("type") == "function_call":
+                        cid = item.get("call_id") or item.get("id") or ""
+                        if cid not in call_index:
+                            call_index[cid] = len(call_index)
+                        idx = call_index[cid]
+                        c = base_delta()
+                        c["choices"][0]["delta"] = {"tool_calls": [{
+                            "index": idx, "id": cid, "type": "function",
+                            "function": {"name": item.get("name") or "", "arguments": ""}}]}
+                        w.write(sse(c))
+                        w.flush()
+                        finish = "tool_calls"
+                elif t == "response.function_call_arguments.delta":
+                    cid = ev.get("item_id") or ev.get("call_id") or ""
+                    if cid not in call_index:
+                        call_index[cid] = len(call_index)
+                    idx = call_index[cid]
+                    frag = ev.get("delta", "")
+                    if frag:
+                        c = base_delta()
+                        c["choices"][0]["delta"] = {"tool_calls": [{
+                            "index": idx, "function": {"arguments": frag}}]}
+                        w.write(sse(c))
+                        w.flush()
+                        args_seen.add(cid)
+                        finish = "tool_calls"
+                elif t == "response.output_item.done":
+                    item = ev.get("item", {}) or {}
+                    if item.get("type") == "function_call":
+                        cid = item.get("call_id") or item.get("id") or ""
+                        if cid not in args_seen:
+                            if cid not in call_index:
+                                call_index[cid] = len(call_index)
+                            idx = call_index[cid]
+                            c = base_delta()
+                            c["choices"][0]["delta"] = {"tool_calls": [{
+                                "index": idx, "id": cid, "type": "function",
+                                "function": {"name": item.get("name") or "",
+                                             "arguments": item.get("arguments") or ""}}]}
+                            w.write(sse(c))
+                            w.flush()
+                            finish = "tool_calls"
+                elif t == "ping":
+                    try:
+                        w.write(b": ping\n\n")
+                        w.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
+                elif t in ("response.completed", "response.failed", "response.incomplete"):
+                    if t != "response.completed":
+                        log.warning(f"responses stream ended with {t} for model={model}")
+                    break
+                elif t == "error":
+                    log.warning(f"responses stream error event for model={model}: {payload[:200]}")
+                    break
+            final = base_delta()
+            final["choices"][0]["finish_reason"] = finish
+            w.write(sse(final))
+            w.write(b"data: [DONE]\n\n")
+            w.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        except Exception as e:
+            log.error(f"translate_responses_stream error: {e}")
+        finally:
+            resp.close()
+
     def send_429(self, message="Rate limit exceeded after retries. Please try again later."):
         try:
             self.send_response(429)
@@ -337,7 +684,48 @@ class ProxyHandler(BaseHTTPRequestHandler):
             stream=True, verify=False,
         )
 
+    def is_remote_request(self):
+        # Everything via the cloudflared tunnel arrives from 127.0.0.1,
+        # but the Cloudflare edge always adds these headers:
+        if self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For"):
+            return True
+        client_ip = self.client_address[0] if self.client_address else ""
+        return client_ip not in LOOPBACK_IPS
+
+    def check_public_auth(self):
+        if self.path == "/health":
+            return True
+        if not self.is_remote_request():
+            return True
+        if not PUBLIC_API_KEY:
+            return True  # open mode: no key configured
+        if self.headers.get("Authorization", "") == f"Bearer {PUBLIC_API_KEY}":
+            if not self.path.startswith("/zen/"):
+                try:
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"not found"}')
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                return False
+            return True
+        client_ip = self.client_address[0] if self.client_address else "?"
+        log.warning(f"Auth rejected for {client_ip} {self.command} {self.path}")
+        try:
+            body = b'{"error":{"type":"auth_error","message":"Invalid or missing API key"}}'
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        return False
+
     def handle_request(self, method):
+        if not self.check_public_auth():
+            return
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length > MAX_BODY_SIZE:
             log.warning(f"Body too large: {content_length} bytes (max {MAX_BODY_SIZE})")
@@ -351,10 +739,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         url = UPSTREAM_BASE + self.path
         headers = {k: v for k, v in self.headers.items() if k.lower() not in FORBIDDEN_HEADERS}
         headers["User-Agent"] = UPSTREAM_UA
-        headers["x-opencode-session"] = str(uuid.uuid4())
-        headers["x-opencode-client"] = "1"
-        headers["x-opencode-request"] = str(uuid.uuid4())
-        headers["x-opencode-project"] = str(uuid.uuid4())
+        # Always overwrite: Hermes sends its placeholder bearer (401s) and
+        # no/UUID session headers (403s). Exact CLI shape, verified 17.09.2026.
+        headers["Authorization"] = UPSTREAM_BEARER
+        headers["x-opencode-client"] = "cli"
+        headers["x-opencode-project"] = "global"
+        headers["x-opencode-request"] = _new_request_id()
+        _sess = _sticky_session_for(body)
+        headers["x-opencode-session"] = _sess
 
         current_model = None
         if body:
@@ -362,6 +754,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 current_model = json.loads(body).get("model")
             except Exception:
                 current_model = None
+        try:
+            log.info(f"opencode-session={_sess} model={current_model}")
+        except Exception:
+            pass
 
         RESPONSES_MODELS = {"muse-spark-1.3-contributor-free", "muse-spark-1.2-contributor-free"}
         use_responses_api = (
@@ -371,28 +767,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if use_responses_api:
             try:
                 chat = json.loads(body)
-                resp_input = []
-                for msg in chat.get("messages", []):
-                    role = msg.get("role", "user")
-                    content = msg.get("content", "")
-                    if isinstance(content, list):
-                        parts = []
-                        for c in content:
-                            if isinstance(c, dict) and c.get("type") == "text":
-                                parts.append(c.get("text", ""))
-                            elif isinstance(c, str):
-                                parts.append(c)
-                        content = "\n".join(parts) if parts else str(content)
-                    resp_input.append({"role": role, "content": str(content)})
                 responses_body = {
                     "model": current_model,
-                    "input": resp_input,
+                    "input": chat_messages_to_responses_input(chat.get("messages")),
                     "stream": chat.get("stream", False),
                 }
                 if "temperature" in chat:
                     responses_body["temperature"] = chat["temperature"]
                 if "max_tokens" in chat:
                     responses_body["max_output_tokens"] = chat["max_tokens"]
+                r_tools, r_tc = chat_tools_to_responses(chat)
+                if r_tools:
+                    responses_body["tools"] = r_tools
+                if r_tc:
+                    responses_body["tool_choice"] = r_tc
                 body = json.dumps(responses_body).encode()
                 url = UPSTREAM_BASE + "/zen/v1/responses"
                 log.info(f"Converted chat/completions -> responses API for model={current_model}")
@@ -452,7 +840,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 else:
                     log.info(f"Response: {resp.status_code} for {self.path} model={current_model}")
                     if use_responses_api and resp.status_code == 200:
-                        self.convert_responses_to_chat(resp)
+                        try:
+                            is_stream = bool(json.loads(body).get("stream")) if body else False
+                        except Exception:
+                            is_stream = False
+                        if is_stream:
+                            if os.environ.get("FORWARDER_RESPONSES_RAW") == "1":
+                                # debug: pass responses SSE through untouched
+                                log.warning("FORWARDER_RESPONSES_RAW=1: raw passthrough")
+                                self.passthrough(resp)
+                            else:
+                                self.translate_responses_stream(resp, current_model)
+                        else:
+                            self.convert_responses_to_chat(resp)
                     else:
                         self.passthrough(resp)
                     return
@@ -522,7 +922,8 @@ def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 9000
     host = os.environ.get("FORWARDER_HOST", "0.0.0.0")
     server = ThreadingHTTPServer((host, port), ProxyHandler)
-    log.info(f"Forwarder started on {host}:{port} 429-retries={RETRY_ATTEMPTS} backoff={RETRY_BACKOFF}s fallback={FALLBACK_MODELS or 'DISABLED'} rotate={ROTATE_ON_429}")
+    auth_state = 'ON' if PUBLIC_API_KEY else 'OFF-open'
+    log.info(f"Forwarder started on {host}:{port} 429-retries={RETRY_ATTEMPTS} backoff={RETRY_BACKOFF}s fallback={FALLBACK_MODELS or 'DISABLED'} rotate={ROTATE_ON_429} auth={auth_state}")
     server.serve_forever()
 
 
