@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh Hermes free model lists every 6h
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+Unit=hermes-refresh-models.service
+
+[Install]
+WantedBy=timers.target

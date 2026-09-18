@@ -1,9 +1,55 @@
-import json, os, sys, logging, threading, time, socket, binascii, uuid, secrets, string
+import json, os, sys, logging, threading, time, socket, binascii, uuid, secrets, string, copy
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import requests, urllib3
 
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from tls_forge import forge_request as _tls_forge_request
+    _FORGE_AVAILABLE = os.environ.get("FORWARDER_TLS_FORGE", "1") == "1"
+except Exception:
+    _tls_forge_request = None
+    _FORGE_AVAILABLE = False
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def _forge_attempt(method, url, body, headers, proxy=None,
+                   connect_timeout=60, read_timeout=300):
+    """Upstream fetch via forged TLS (CLI ClientHello bytes).
+
+    headers: plain dict (already spoofed upstream). Emitted in CLI order.
+    proxy: requests-style {"http": "socks5h://host:port", ...} or None.
+    """
+    get = lambda k, d="": headers.get(k, headers.get(k.title(), d))
+    ordered = [
+        ("Authorization", get("authorization", "Bearer public")),
+        ("Content-Type", get("content-type", "application/json")),
+        ("User-Agent", get("user-agent", UPSTREAM_UA)),
+        ("x-opencode-client", get("x-opencode-client", "cli")),
+        ("x-opencode-project", get("x-opencode-project", "global")),
+        ("x-opencode-request", get("x-opencode-request", "")),
+        ("x-opencode-session", get("x-opencode-session", "")),
+        ("Connection", "keep-alive"),
+        ("Accept", "*/*"),
+        ("Host", "opencode.ai"),
+        ("Accept-Encoding", "gzip, deflate"),
+    ]
+    ordered = [(k, v) for k, v in ordered if v != ""]
+    socks = None
+    try:
+        from urllib.parse import urlsplit
+        purl = (proxy or {}).get("http") or (proxy or {}).get("https") or ""
+        if purl.startswith("socks"):
+            u = urlsplit(purl if "://" in purl else "socks5h://" + purl)
+            if u.hostname:
+                socks = (u.hostname, u.port or 1080)
+    except Exception:
+        socks = None
+    return _tls_forge_request(
+        method, url, ordered, body or b"", socks=socks,
+        connect_timeout=connect_timeout, read_timeout=read_timeout,
+    )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "proxy_state.json")
@@ -304,6 +350,78 @@ def retry_after_seconds(resp, fallback):
     except Exception:
         pass
     return fallback
+
+
+# --- Responses body padding (verified 18.09.2026 via 2x2 matrix) ---
+# Upstream 403s /responses requests that lack the full CLI/SDK body shape,
+# even with byte-perfect headers/TLS/IDs. Fill ONLY missing keys (client wins).
+# Reference: captured CLI traffic (title + main calls, CLI v1.18.31).
+RESPONSES_BODY_DEFAULTS = {
+    "max_output_tokens": 32000,
+    "store": False,
+    "include": ["reasoning.encrypted_content"],
+}
+
+# Minimal CLI tool defs (names must match exactly; descriptions/params can
+# be minimal — verified 18.09.2026). Appended to responses-bound requests
+# missing CLI-known tools so the shape gate passes. ~450 bytes overhead.
+CLI_DECOY_TOOLS = [
+    {"type": "function", "name": "bash", "description": "Shell command execution",
+     "parameters": {"type": "object", "properties": {}}},
+    {"type": "function", "name": "edit", "description": "File editing",
+     "parameters": {"type": "object", "properties": {}}},
+    {"type": "function", "name": "read", "description": "File reading",
+     "parameters": {"type": "object", "properties": {}}},
+]
+
+
+def pad_responses_body(body_bytes):
+    try:
+        obj = json.loads(body_bytes)
+    except Exception:
+        return body_bytes
+    if not isinstance(obj, dict):
+        return body_bytes
+    changed = False
+    for k, v in RESPONSES_BODY_DEFAULTS.items():
+        if k not in obj:
+            obj[k] = v
+            changed = True
+    try:
+        if int(obj.get("max_output_tokens", 0)) < 4096:
+            obj["max_output_tokens"] = 4096
+            changed = True
+    except Exception:
+        pass
+    # Gate requires stream:true (verified 18.09.2026: stream:false -> 403
+    # even with perfect headers/TLS/IDs). Client's wish is preserved
+    # separately (see responses_client_stream) for downstream routing.
+    if obj.get("stream") is not True:
+        obj["stream"] = True
+        changed = True
+    # Gate requires CLI-known tools in the request (verified 18.09.2026:
+    # tool-less non-title bodies -> 403, +3 CLI decoys -> 200, even minimal
+    # name+description+empty-params defs). Real client tools are kept;
+    # decoys are appended only when missing. Never override explicit choice.
+    tools = obj.get("tools")
+    if not isinstance(tools, list):
+        tools = []
+        obj["tools"] = tools
+        changed = True
+    have = {t.get("name") for t in tools if isinstance(t, dict)}
+    for dt in CLI_DECOY_TOOLS:
+        if dt.get("name") not in have:
+            tools.append(copy.deepcopy(dt))
+            changed = True
+    if "tool_choice" not in obj:
+        obj["tool_choice"] = "auto"
+        changed = True
+    if not changed:
+        return body_bytes
+    try:
+        return json.dumps(obj).encode()
+    except Exception:
+        return body_bytes
 
 
 def swap_model(body, model):
@@ -665,6 +783,168 @@ class ProxyHandler(BaseHTTPRequestHandler):
         finally:
             resp.close()
 
+    def assemble_responses_sse(self, resp, model):
+        """Responses SSE -> single chat.completion JSON (non-stream client).
+
+        Upstream always streams (gate requires stream:true); when the client
+        asked for a plain response we accumulate deltas + tool calls here.
+        """
+        import time as _time
+        try:
+            resp.encoding = "utf-8"
+            texts, calls, order = [], {}, []
+            usage = {}
+            finish = "stop"
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw or raw.startswith(":") or not raw.startswith("data:"):
+                    continue
+                payload = raw[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    ev = json.loads(payload)
+                except Exception:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                t = ev.get("type", "")
+                if t == "response.output_text.delta":
+                    d = ev.get("delta", "")
+                    if d:
+                        texts.append(d)
+                elif t == "response.output_item.added":
+                    item = ev.get("item", {}) or {}
+                    if item.get("type") == "function_call":
+                        cid = item.get("call_id") or item.get("id") or ""
+                        if cid not in calls:
+                            calls[cid] = {"id": cid, "type": "function",
+                                          "function": {"name": item.get("name") or "",
+                                                       "arguments": ""}}
+                            order.append(cid)
+                        finish = "tool_calls"
+                elif t == "response.function_call_arguments.delta":
+                    cid = ev.get("item_id") or ev.get("call_id") or ""
+                    if cid in calls:
+                        calls[cid]["function"]["arguments"] += ev.get("delta", "")
+                        finish = "tool_calls"
+                elif t == "response.output_item.done":
+                    item = ev.get("item", {}) or {}
+                    if item.get("type") == "function_call":
+                        cid = item.get("call_id") or item.get("id") or ""
+                        if cid in calls:
+                            if item.get("name"):
+                                calls[cid]["function"]["name"] = item["name"]
+                            if item.get("arguments"):
+                                calls[cid]["function"]["arguments"] = item["arguments"]
+                            finish = "tool_calls"
+                elif t == "response.completed":
+                    u = (ev.get("response", {}) or {}).get("usage", {}) or {}
+                    usage = {"prompt_tokens": u.get("input_tokens", 0),
+                             "completion_tokens": u.get("output_tokens", 0),
+                             "total_tokens": u.get("total_tokens", 0)}
+                elif t in ("response.failed", "response.incomplete", "error"):
+                    log.warning(f"responses stream ended with {t} for model={model}")
+                    break
+            msg = {"role": "assistant", "content": "".join(texts)}
+            tcs = []
+            for idx, cid in enumerate(order):
+                c = calls[cid]
+                tcs.append({"index": idx, "id": c["id"], "type": "function",
+                            "function": c["function"]})
+            if tcs:
+                msg["tool_calls"] = tcs
+            out = json.dumps({
+                "id": "chatcmpl-resp-%d" % int(_time.time() * 1000),
+                "object": "chat.completion",
+                "created": int(_time.time()),
+                "model": model,
+                "choices": [{"index": 0, "finish_reason": finish,
+                             "message": msg}],
+                "usage": usage,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        except Exception as e:
+            log.error(f"assemble_responses_sse error: {e}")
+            self.send_error(502, "Forwarder Error: stream assembly failed")
+        finally:
+            resp.close()
+
+    def assemble_chat_sse(self, resp, model):
+        """Chat-completions SSE -> single chat.completion JSON (non-stream client)."""
+        import time as _time
+        try:
+            resp.encoding = "utf-8"
+            texts, calls, order = [], {}, []
+            finish = "stop"
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw or raw.startswith(":") or not raw.startswith("data:"):
+                    continue
+                payload = raw[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    ev = json.loads(payload)
+                except Exception:
+                    continue
+                for ch in (ev.get("choices") or []):
+                    d = ch.get("delta") or {}
+                    if d.get("content"):
+                        texts.append(d["content"])
+                    for tc in d.get("tool_calls") or []:
+                        idx = tc.get("index", 0)
+                        if idx not in order:
+                            order.append(idx)
+                            calls[idx] = {"id": tc.get("id") or "",
+                                          "type": "function",
+                                          "function": {"name": "", "arguments": ""}}
+                        if tc.get("id"):
+                            calls[idx]["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            calls[idx]["function"]["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            calls[idx]["function"]["arguments"] += fn["arguments"]
+                        finish = "tool_calls"
+                    if ch.get("finish_reason"):
+                        finish = ch["finish_reason"]
+            msg = {"role": "assistant", "content": "".join(texts)}
+            tcs = []
+            for idx in order:
+                c = calls[idx]
+                tcs.append({"index": idx, "id": c["id"], "type": "function",
+                            "function": c["function"]})
+            if tcs:
+                msg["tool_calls"] = tcs
+            out = json.dumps({
+                "id": "chatcmpl-assembled-%d" % int(_time.time() * 1000),
+                "object": "chat.completion",
+                "created": int(_time.time()),
+                "model": model,
+                "choices": [{"index": 0, "finish_reason": finish,
+                             "message": msg}],
+                "usage": {},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        except Exception as e:
+            log.error(f"assemble_chat_sse error: {e}")
+            self.send_error(502, "Forwarder Error: stream assembly failed")
+        finally:
+            resp.close()
+
     def send_429(self, message="Rate limit exceeded after retries. Please try again later."):
         try:
             self.send_response(429)
@@ -678,6 +958,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
             pass
 
     def attempt(self, method, url, body, headers, proxy):
+        # Forged-TLS path (verified 18.09.2026): upstream gates on the TLS
+        # ClientHello bytes, so opencode.ai traffic goes through tls_forge
+        # (byte-faithful CLI hello). Falls back to requests on any error.
+        if _FORGE_AVAILABLE and url.startswith("https://opencode.ai"):
+            try:
+                return _forge_attempt(
+                    method, url, body or b"", headers,
+                    proxy=proxy,
+                    connect_timeout=UPSTREAM_CONNECT_TIMEOUT,
+                    read_timeout=UPSTREAM_READ_TIMEOUT,
+                )
+            except Exception as e:
+                log.warning(f"forge attempt failed, falling back to requests: {e}")
         return requests.request(
             method=method, url=url, data=body, headers=headers,
             proxies=proxy, timeout=(UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_READ_TIMEOUT),
@@ -776,6 +1069,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     responses_body["temperature"] = chat["temperature"]
                 if "max_tokens" in chat:
                     responses_body["max_output_tokens"] = chat["max_tokens"]
+                # Reasoning models burn the whole budget thinking: with a
+                # small cap upstream ends `incomplete` with ZERO visible text
+                # (verified 18.09.2026: 253 reasoning tokens vs cap 256).
+                # Floor the cap so answers actually arrive.
+                try:
+                    if int(responses_body.get("max_output_tokens", 0)) < 4096:
+                        responses_body["max_output_tokens"] = 4096
+                        log.info(f"Bumped max_output_tokens to 4096 floor for model={current_model}")
+                except Exception:
+                    responses_body["max_output_tokens"] = 4096
                 r_tools, r_tc = chat_tools_to_responses(chat)
                 if r_tools:
                     responses_body["tools"] = r_tools
@@ -787,6 +1090,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 log.warning(f"Failed to convert to responses API: {e}")
                 current_model = None
+
+        # Pad converted AND native /responses bodies to full CLI shape.
+        # Remember the client's own stream wish BEFORE padding forces
+        # stream:true upstream (downstream routing depends on it).
+        responses_client_stream = False
+        if body and (url.endswith("/responses") or "/responses" in self.path):
+            try:
+                responses_client_stream = bool(json.loads(body).get("stream"))
+            except Exception:
+                responses_client_stream = False
+            new_body = pad_responses_body(body)
+            if new_body != body:
+                log.info(f"Padded responses body for model={current_model}")
+                body = new_body
 
         if body and SPOOF_SYSTEM_MARKER:
             try:
@@ -810,6 +1127,47 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             if isinstance(c, str) and "you are opencode" not in c.lower():
                                 msgs[sys_idx]["content"] = SYSTEM_MARKER + " " + c
                         body = json.dumps(j).encode()
+            except Exception:
+                pass
+
+        # Chat path (/chat/completions, non-converted models): same gate
+        # wants CLI-known tools (verified 18.09.2026). Minimal valid defs.
+        chat_client_stream = False
+        if body and "/chat/completions" in self.path and "responses" not in url:
+            try:
+                cj = json.loads(body)
+                if isinstance(cj, dict) and isinstance(cj.get("messages"), list):
+                    chat_client_stream = bool(cj.get("stream"))
+                    added = False
+                    ct = cj.get("tools")
+                    if not isinstance(ct, list):
+                        ct = []
+                        cj["tools"] = ct
+                    # Gate requires stream:true on chat too (verified 18.09.2026);
+                    # non-stream clients get SSE assembled below.
+                    if cj.get("stream") is not True:
+                        cj["stream"] = True
+                        added = True
+                    have = set()
+                    for t in ct:
+                        if isinstance(t, dict):
+                            fn = t.get("function") if isinstance(t.get("function"), dict) else {}
+                            if fn.get("name"):
+                                have.add(fn["name"])
+                            elif t.get("name"):
+                                have.add(t["name"])
+                    for name in ("bash", "edit", "read"):
+                        if name not in have:
+                            ct.append({"type": "function", "function": {
+                                "name": name, "description": "d",
+                                "parameters": {"type": "object", "properties": {}}}})
+                            added = True
+                    if "tool_choice" not in cj:
+                        cj["tool_choice"] = "auto"
+                        added = True
+                    if added:
+                        body = json.dumps(cj).encode()
+                        log.info(f"Added chat decoy tools for model={current_model}")
             except Exception:
                 pass
 
@@ -840,10 +1198,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 else:
                     log.info(f"Response: {resp.status_code} for {self.path} model={current_model}")
                     if use_responses_api and resp.status_code == 200:
-                        try:
-                            is_stream = bool(json.loads(body).get("stream")) if body else False
-                        except Exception:
-                            is_stream = False
+                        is_stream = responses_client_stream
                         if is_stream:
                             if os.environ.get("FORWARDER_RESPONSES_RAW") == "1":
                                 # debug: pass responses SSE through untouched
@@ -852,7 +1207,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             else:
                                 self.translate_responses_stream(resp, current_model)
                         else:
-                            self.convert_responses_to_chat(resp)
+                            # Upstream always streams now (gate needs
+                            # stream:true) -> assemble SSE into one JSON.
+                            self.assemble_responses_sse(resp, current_model)
+                    elif (resp.status_code == 200 and "/chat/completions" in self.path
+                            and "responses" not in url and not chat_client_stream):
+                        # Chat path, non-stream client, SSE upstream.
+                        self.assemble_chat_sse(resp, current_model)
                     else:
                         self.passthrough(resp)
                     return

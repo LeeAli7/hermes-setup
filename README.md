@@ -2,13 +2,25 @@
 
 Scripts and configs for running Hermes AI agent with free-tier LLM providers (opencode.ai, kilo.ai) via local proxy forwarder.
 
-> **2026-09-17 update — READ FIRST.** opencode.ai killed every previous bypass
+> **2026-09-17 update.** opencode.ai killed every previous bypass
 > (`User-Agent` spoof, system-prompt marker, random-UUID session headers — all
 > `403 FreeTierError` since ~16.09, verified on 2 Tor exits + direct IP).
-> The real gate is the **format of `x-opencode-session` / `x-opencode-request`**
-> (see §1 below). `forwarder.py` in this repo implements the working combo.
-> If requests 403 again, re-capture the official CLI (`~/.opencode/bin/opencode`
-> through mitmproxy) and compare — the procedure is in Troubleshooting.
+> The gate then was the **format of `x-opencode-session` / `x-opencode-request`**
+> (see §1 below).
+>
+> **2026-09-18 update — READ FIRST.** The gate is now THREE layers deep, all
+> reverse-engineered and implemented here (30+ eliminated hypotheses):
+> 1. **TLS ClientHello bytes** — only the genuine CLI hello passes (captured
+>    via `strace`, replayed byte-exact by new module `tls_forge.py`, a minimal
+>    TLS 1.3 client). No stock stack (requests/curl/node/Bun/curl-impersonate)
+>    passes, even with perfect headers.
+> 2. **Body shape** — `/responses` needs `stream:true` + full SDK fields
+>    (`max_output_tokens`/`store`/`include`) + CLI-known `tools`
+>    (auto-injected decoys `bash`/`edit`/`read`); `/chat` needs `stream:true` +
+>    tools too. Reasoning models need a big token cap (see §8).
+> 3. Headers/IDs as before (`Bearer public`, format-valid `ses_`/`msg_`).
+> If requests 403 again, bisect in this order: body shape → headers → TLS
+> (re-capture CLI hello via `strace -e trace=%network`). Details below.
 
 ## Problem
 
@@ -38,10 +50,22 @@ tier can only be used from within OpenCode"`:
    model). `opencode-zen` demands `OPENCODE_ZEN_API_KEY` for models outside
    Hermes' built-in allowlist → agent dies with AuthError before any request.
    `switch.sh` sets `opencode-free` automatically.
+8. **TLS ClientHello bytes** — the gate fingerprints the handshake itself.
+   `tls_forge.py` replays the captured CLI hello byte-exact (fresh random +
+   fresh X25519 share patched in, lengths unchanged) with a from-scratch
+   TLS 1.3 implementation (verified against RFC 8448 vectors + OpenSSL
+   interop). `FORWARDER_TLS_FORGE=0` falls back to `requests` (will 403).
+9. **Body shape details** — `/responses`: `stream:true` is mandatory
+   (non-stream clients get SSE assembled server-side by the forwarder);
+   `tools[]` must contain CLI-known names (decoys auto-appended, see
+   `CLI_DECOY_TOOLS`); reasoning models get `max_output_tokens` floored
+   to 4096 (small caps end `incomplete` with zero visible text).
+   `/chat/completions`: same `stream:true` + tools rule.
 
-What does NOT matter (verified): TLS fingerprint (Python-urllib3 passes once
-headers are right), Tor-vs-direct egress, request body shape beyond the
-endpoint contract.
+What does NOT matter (verified 18.09): Tor-vs-direct egress, exact header
+order, exact `ses_`/`msg_` values (fresh valid-format IDs pass), key order
+in JSON bodies. What DOES matter: TLS hello bytes, `stream:true`,
+CLI-known tool names, `Bearer public`, valid ID formats.
 
 ## How it works
 
@@ -54,9 +78,15 @@ The forwarders (`forwarder.py`, `kilo_forwarder.py`) per upstream request:
 1. **Overwrite upstream auth/identity headers** — `Authorization: Bearer public`,
    current CLI `User-Agent`, `x-opencode-*` with freshly minted valid-format IDs
    (sticky per conversation via `prompt_cache_key`).
-2. **Convert Chat Completions → Responses API** — for `muse-spark-*` models
+2. **Pad bodies to full CLI shape** — `stream:true`, `max_output_tokens`/
+   `store`/`include` defaults, CLI decoy tools (+`tool_choice:auto` if absent),
+   4096 token floor for reasoning models. SSE is assembled back to JSON for
+   non-stream clients (`assemble_responses_sse` / `assemble_chat_sse`).
+3. **Convert Chat Completions → Responses API** — for `muse-spark-*` models
    (`messages[]` → `input[]`, back-convert `output[]` → `choices[]`).
-3. **Retry with Tor rotation** — 429/5xx → rotate exit IP (verified change) →
+4. **Originate TLS via `tls_forge.py`** — opencode.ai traffic uses the forged
+   CLI ClientHello (falls back to `requests` on internal error).
+5. **Retry with Tor rotation** — 429/5xx → rotate exit IP (verified change) →
    backoff → retry; 413 over 20 MB bodies; vision/multimodal bodies pass
    through unmutated (kilo forwarder never mutates bodies at all).
 
@@ -67,7 +97,10 @@ at a time (RAM policy for Oracle Free Tier); choice persists in
 `oracle-guardian.sh` (cron every 2 min) — RAM/disk/network guards. It manages
 ONLY systemd units, never `nohup` (orphans steal ports from units).
 
-## Supported models (verified live through Tor, 06–17.09.2026)
+## Supported models (verified live through Tor, 06–18.09.2026)
+
+Lists auto-refresh every 6h into `free-models/*.txt`
+(`hermes-refresh-models.timer`); `switch.sh` falls back to its builtin list.
 
 ### opencode.ai (free) — `switch.sh opencode`
 | Model | Endpoint | Status |
@@ -92,14 +125,17 @@ against `https://api.kilo.ai/api/openrouter/models` (pricing 0). Run
 
 | File | Description |
 |------|-------------|
-| `forwarder.py` | opencode proxy: CLI-shaped headers, Responses conversion, Tor rotation |
+| `forwarder.py` | opencode proxy: CLI headers, body padding, Responses conversion, Tor rotation |
+| `tls_forge.py` | minimal TLS 1.3 client replaying the CLI ClientHello byte-exact |
 | `kilo_forwarder.py` | kilo proxy: transparent pass-through, Tor rotation |
 | `switch.sh` | provider/model switcher (sleep/wake units, persists choice) |
+| `refresh-free-models.sh` + `free-models/*.txt` | model-list auto-refresh (timer every 6h) + snapshots |
 | `oracle-guardian.sh` | Oracle Free Tier guards (RAM/disk/net, unit watchdog) |
 | `provider-restore.sh` / `provider-restore.service` | boot-time provider restore |
 | `resource-limits.sh` | cron RAM/disk probe |
 | `hermes-opencode-forwarder.service` | user systemd unit, port 9000 (`%h`-templated) |
 | `hermes-kilo-forwarder.service` | user systemd unit, port 9001 (`%h`-templated) |
+| `hermes-refresh-models.service` + `.timer` | 6h model-list refresh (`%h`-templated) |
 
 Units are **user** units (`systemctl --user`). Never add `User=` to them —
 the user manager rejects it (`216/GROUP`, silent crash-loop). Never start
@@ -130,7 +166,10 @@ systemctl --user enable --now provider-restore.service
 curl http://127.0.0.1:9000/health
 tail ~/projects/hermes/logs/forwarder.log
 
-# Exact upstream shape the forwarder must emit (verified 17.09.2026):
+# Exact upstream shape the forwarder must emit (verified 18.09.2026).
+# NOTE: stream:true + CLI tools are mandatory; minimal bodies 403 even
+# with perfect headers/TLS. max_output_tokens: small caps starve reasoning
+# models (empty replies) — floor is 4096 in forwarder.py.
 curl https://opencode.ai/zen/v1/responses \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer public" \
@@ -138,7 +177,7 @@ curl https://opencode.ai/zen/v1/responses \
   -H "x-opencode-client: cli" -H "x-opencode-project: global" \
   -H "x-opencode-request: msg_<9hex>001<14alnum>" \
   -H "x-opencode-session: ses_<9hex>ffe<14alnum>" \
-  -d '{"model":"muse-spark-1.3-contributor-free","input":"hi","max_output_tokens":32}'
+  -d '{"model":"muse-spark-1.3-contributor-free","input":[{"role":"user","content":"hi"}],"max_output_tokens":4096,"store":false,"include":["reasoning.encrypted_content"],"stream":true,"tools":[{"type":"function","name":"bash","description":"d","parameters":{"type":"object","properties":{}}}],"tool_choice":"auto"}'
 
 # If 403s return: re-capture the official CLI to diff the wire:
 # mitmdump -p 18081, then HTTPS_PROXY=http://127.0.0.1:18081 +

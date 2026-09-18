@@ -4,15 +4,16 @@ set -e
 HERMES="/home/ubuntu/.hermes/hermes-agent/venv/bin/hermes"
 STATE="$HOME/.config/hermes-switch.state"
 
-# --- Live free models (06.09.2026, проверено через Tor) ---
-# opencode (https://opencode.ai/zen/v1/models): ВСЕ 7 с приставкой free.
-#   200 OK: ling-3.0-flash-fin-free, mimo-v2.5-free, nemotron-3-ultra-free, nemotron-3.5-lightning-free.
-#   Нестабильные (forwarder ретраит с ротацией IP): deepseek-v4-flash-free (400 Model is unavailable),
-#   muse-spark-1.2/1.3-contributor-free (500 Internal server error).
-opencode_models="deepseek-v4-flash-free ling-3.0-flash-fin-free mimo-v2.5-free muse-spark-1.2-contributor-free muse-spark-1.3-contributor-free nemotron-3-ultra-free nemotron-3.5-lightning-free"
-# kilo (https://api.kilo.ai/api/openrouter/models): ВСЕ 19 с free в id (200 OK, проверено).
-#   minimax-m3/inkling/inkling-small — живые, но 429-лимит (forwarder ротирует IP).
-kilo_models="kilo-auto/free openrouter/free stepfun/step-3.7-flash:free poolside/laguna-s-2.1:free minimax/minimax-m3:free inclusionai/ling-3.0-flash-sante:free inclusionai/ling-3.0-flash-fin:free dots-studio/dots-3-note-preview:free liquid/lfm-2.5-2.6b:free nvidia/nemotron-3.5-lightning:free thinkingmachines/inkling-small:free thinkingmachines/inkling:free poolside/laguna-xs-2.1:free cohere/north-mini-code:free nvidia/nemotron-3.5-content-safety:free nvidia/nemotron-3-ultra-550b-a55b:free nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free nvidia/nemotron-3-super-120b-a12b:free minimax/minimax-m2.7:free"
+# --- Live free models (auto-refresh, см. refresh-free-models.sh) ---
+# Источник правды: free-models/*.txt (таймер hermes-refresh-models раз в 6 ч).
+# Fallback — встроенный список, если файлов нет/пустые.
+FREE_MODELS_DIR="$(dirname "$0")/free-models"
+FALLBACK_OPENCODE_MODELS="deepseek-v4-flash-free ling-3.0-flash-fin-free mimo-v2.5-free muse-spark-1.2-contributor-free muse-spark-1.3-contributor-free nemotron-3-ultra-free nemotron-3.5-lightning-free"
+FALLBACK_KILO_MODELS="kilo-auto/free openrouter/free stepfun/step-3.7-flash:free poolside/laguna-s-2.1:free minimax/minimax-m3:free inclusionai/ling-3.0-flash-sante:free inclusionai/ling-3.0-flash-fin:free dots-studio/dots-3-note-preview:free liquid/lfm-2.5-2.6b:free nvidia/nemotron-3.5-lightning:free thinkingmachines/inkling-small:free thinkingmachines/inkling:free poolside/laguna-xs-2.1:free cohere/north-mini-code:free nvidia/nemotron-3.5-content-safety:free nvidia/nemotron-3-ultra-550b-a55b:free nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free nvidia/nemotron-3-super-120b-a12b:free minimax/minimax-m2.7:free"
+opencode_models="$(tr '\n' ' ' 2>/dev/null < "$FREE_MODELS_DIR/opencode.txt" | tr -s ' ' | sed 's/^ //;s/ $//')" || true
+if [ -z "$opencode_models" ]; then opencode_models="$FALLBACK_OPENCODE_MODELS"; fi
+kilo_models="$(tr '\n' ' ' 2>/dev/null < "$FREE_MODELS_DIR/kilo.txt" | tr -s ' ' | sed 's/^ //;s/ $//')" || true
+if [ -z "$kilo_models" ]; then kilo_models="$FALLBACK_KILO_MODELS"; fi
 kiro_models="claude-sonnet-4 claude-sonnet-4.5 claude-haiku-4.5 qwen3-coder-next deepseek-3.2 minimax-m2.5 minimax-m2.1 glm-5"
 qwenmode_models="Qwen3.8-Max"
 chatgpt_models="gpt-5-6"
