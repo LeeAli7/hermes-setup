@@ -1,8 +1,14 @@
 model:
   default: muse-spark-1.3-contributor-free
-  provider: opencode-zen
+  provider: opencode-free
   base_url: http://127.0.0.1:9000/zen/v1
-provider: opencode-zen
+  # opencode-zen demands OPENCODE_ZEN_API_KEY for models outside Hermes'
+  # built-in allowlist -> AuthError. opencode-free is keyless by contract.
+  # supports_vision: models.dev doesn't know the opencode-free alias and
+  # returns unknown -> gateway falls back to text-stub vision mode.
+  # Force native so photos go straight to the main model.
+  supports_vision: true
+provider: opencode-free
 toolsets:
 - hermes-cli
 platform_toolsets:

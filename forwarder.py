@@ -452,6 +452,49 @@ def chat_text_of(content):
     return str(content or "")
 
 
+def chat_content_to_responses(content):
+    """OpenAI chat content -> Responses input content, preserving images.
+
+    Text-only content stays a plain string (unchanged wire behavior).
+    Multimodal content becomes a list of input_text/input_image items so
+    the image actually reaches the model (previously image_url blocks were
+    silently dropped and vision returned stubs).
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return chat_text_of(content)
+    items = []
+    for c in content:
+        if isinstance(c, str):
+            if c:
+                items.append({"type": "input_text", "text": c})
+            continue
+        if not isinstance(c, dict):
+            continue
+        t = c.get("type")
+        if t == "text" and isinstance(c.get("text"), str):
+            items.append({"type": "input_text", "text": c.get("text", "")})
+        elif t == "input_text" and isinstance(c.get("text"), str):
+            items.append({"type": "input_text", "text": c.get("text", "")})
+        elif t in ("image_url", "input_image"):
+            ref = c.get("image_url", "")
+            detail = c.get("detail")
+            if isinstance(ref, dict):
+                detail = ref.get("detail", detail)
+                ref = ref.get("url", "")
+            if isinstance(ref, str) and ref:
+                item = {"type": "input_image", "image_url": ref}
+                if isinstance(detail, str) and detail.strip():
+                    item["detail"] = detail.strip()
+                items.append(item)
+    if not items:
+        return chat_text_of(content)
+    if len(items) == 1 and items[0].get("type") == "input_text":
+        return items[0].get("text", "")
+    return items
+
+
 def chat_messages_to_responses_input(messages):
     """Chat messages[] -> Responses input[], preserving tool traffic.
 
@@ -477,6 +520,14 @@ def chat_messages_to_responses_input(messages):
             })
             continue
         text = chat_text_of(msg.get("content"))
+        # Images survive only on user messages: upstream Responses API
+        # rejects input_image on assistant messages with HTTP 400, and
+        # Hermes itself strips them on replay. Everything else flattens
+        # to text exactly as before.
+        if role == "user":
+            content = chat_content_to_responses(msg.get("content"))
+        else:
+            content = text
         tcs = msg.get("tool_calls") if role == "assistant" else None
         if isinstance(tcs, list) and tcs:
             if text:
@@ -498,7 +549,7 @@ def chat_messages_to_responses_input(messages):
                     "arguments": args,
                 })
             continue
-        resp_input.append({"role": role, "content": text})
+        resp_input.append({"role": role, "content": content})
     # Pair up items with empty call_id so upstream validation
     # (call_id length >= 1) passes and each call shares its number
     # with its output: zip calls with outputs in encounter order,
