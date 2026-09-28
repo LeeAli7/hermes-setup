@@ -11,6 +11,11 @@ hermes-agent -> kilo_forwarder.py :9001 -> Tor :9050 -> api.kilo.ai
 ```
 
 > **Changelog (read the entries, they explain WHY things look odd):**
+> - **2026-09-27 — vision verification:** new section “Vision” below with
+>   a reference test image (`vision-ref.png`) and a 3-question protocol
+>   that PROVES pixel vision (defeats text-summary false positives).
+>   Agent self-reports (“I can see…”) are worthless — the old stub message
+>   literally claimed vision while blind. Verify, don't trust.
 > - **2026-09-25 — vision fixes (2):** (a) `forwarder.py` used to *drop*
 >   `image_url` blocks when converting chat→responses for muse models, so
 >   vision returned text stubs. Fixed: images map to `input_image`
@@ -163,6 +168,45 @@ exact `ses_`/`msg_` values (fresh valid-format IDs pass), JSON key order.
 - **kilo**: `switch.sh --list kilo` (19 `:free` + routers). Some are
   429-limited (`minimax-m3`, `inkling*`) — rotated through automatically.
 
+## Vision: native pixels vs text stubs (+ how to PROVE which you have)
+
+Two modes exist. Only one of them means the model actually sees:
+
+| | `native` (want this) | `text` (stubs) |
+|---|---|---|
+| What happens | photo pixels attached inline to the main model request (`input_image`) | photo pre-analyzed by `vision_analyze` tool, model gets only a text description |
+| Agent says | describes real content | `couldn't quite see it` / generic description |
+| Gateway log | `Image routing: native (model supports vision)` | `Image routing: text … Pre-analyzing … via vision_analyze` |
+
+Why `text` kicks in when it shouldn't: `models.dev` doesn't know our
+`opencode-free` alias (`unknown` → fallback). Fix = `model.supports_vision:
+true` in `~/.hermes/config.yaml` (already in the `config.yaml` template
+here) + gateway restart. Second trap (fixed): old `forwarder.py` dropped
+`image_url` blocks when converting chat→responses — this repo's version
+maps them to `input_image` (user messages only; upstream 400s assistant
+images, and Hermes strips them on replay anyway).
+
+**Verification protocol** (run this, don't believe self-reports):
+`vision-ref.png` in this repo is the reference: 736×737, red rectangle top,
+blue rectangle bottom, microtext `KXQ-5193` in the middle, 7 green dots
+bottom row. Ground truth: `KXQ-5193` / `7` / `red, blue`.
+Designed so a text summary CANNOT pass: the auto-describer writes 2–4
+sentences (~150 words) and explicitly skips decorative details — microtext
+and exact counts don't survive it.
+
+1. Send `vision-ref.png` to the agent, ask exactly:
+   1) the exact code text in the middle;
+   2) how many small green dots in the bottom row (exact number);
+   3) colors of the two big rectangles, top to bottom.
+2. Expect: `KXQ-5193` / `7` / `red, blue` (verified live 27.09.2026,
+   terminal `response.completed`).
+3. Cross-check logs for the same turn:
+   - `gateway.log`: `Image routing: native` (not `text`);
+   - `forwarder.log`: big `Body read` (~100+KB base64 inline) + `Response: 200`;
+   - `errors.log`: no `terminal response` / `codex_stream_idle_kill`.
+4. Verdict rule: correct microtext + count **and** all three log signs =
+   sees pixels. Anything less = still on stubs, debug further.
+
 ## Files
 
 | File | Description |
@@ -180,6 +224,7 @@ exact `ses_`/`msg_` values (fresh valid-format IDs pass), JSON key order.
 | `hermes-refresh-models.service` + `.timer` | 6h model-list refresh (`%h`-templated) |
 | `hermes-gateway.service.d/watchdog.conf` | **drop-in**: disables the stream-idle killer (see Changelog 25.09) |
 | `config.yaml` | Hermes config template (opencode-free, supports_vision) |
+| `vision-ref.png` | reference vision test image + ground truth (see Vision above) |
 
 ## Troubleshooting (symptom → cause → fix)
 
@@ -188,8 +233,9 @@ exact `ses_`/`msg_` values (fresh valid-format IDs pass), JSON key order.
   on `~/.opencode/bin/opencode run`, compare ClientHello bytes).
 - **Agent shows photo stubs (`couldn't quite see it`)** → vision routed to
   text mode. Check `supports_vision: true` in `~/.hermes/config.yaml`, then
-  gateway restart. Verify: photo turn should log a big `Body read` and
-  return `response.completed` with real description.
+  gateway restart. Then run the Vision verification protocol above
+  (`vision-ref.png` + 3 questions) — a correct microtext/count answer plus
+  `Image routing: native` in the log is the only acceptable proof.
 - **`did not emit a terminal response` / idle kills** → `watchdog.conf`
   drop-in missing or not loaded (`systemctl --user cat hermes-gateway.service`
   must list it; env must show in `/proc/<gateway-pid>/environ`).
