@@ -1,0 +1,115 @@
+_config_version: 30
+agent:
+  api_max_retries: 3
+  environment_probe: true
+  gateway_timeout: 1800
+  max_turns: 150
+  parallel_tool_call_guidance: true
+  reasoning_effort: high
+  restart_drain_timeout: 180
+  task_completion_guidance: true
+  tool_use_enforcement: auto
+  verbose: false
+compression:
+  abort_on_summary_failure: false
+  codex_gpt55_autoraise: true
+  enabled: true
+  hygiene_hard_message_limit: 400
+  protect_first_n: 3
+  protect_last_n: 20
+  provider: auto
+  target_ratio: 0.2
+  threshold: 0.5
+cron_mode: allow
+discord:
+  bots_require_inline_mention: true
+  enabled: true
+  extra:
+    mention_patterns:
+      - (?i)@Marselubuntubot|марсель|marcel
+  require_mention: false
+fallback_providers: []
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+model:
+  base_url: http://127.0.0.1:9000/zen/v1
+  default: muse-spark-1.3-contributor-free
+  provider: opencode-free
+  context_length: 1000000
+  supports_vision: true
+onboarding:
+  seen:
+    busy_input_prompt: true
+    profile_build_offered: true
+platform_toolsets:
+  cli:
+    - hermes-cli
+  telegram:
+    - hermes-telegram
+platforms:
+  discord:
+    enabled: true
+    home_channel:
+      chat_id: '1544719108208074863'
+      name: '1544719108208074863'
+      platform: discord
+      user_id: '1299757941817217106'
+  telegram:
+    enabled: true
+    home_channel:
+      chat_id: '7311515527'
+      name: ÆII
+      platform: telegram
+      user_id: '7311515527'
+providers:
+  kilo:
+    api_key: anonymous
+    base_url: http://127.0.0.1:9001/api/openrouter
+  kiro:
+    api_key: unused
+    base_url: http://127.0.0.1:8080/v1
+  opencode-zen:
+    api_key: public
+    base_url: http://127.0.0.1:9000/zen/v1
+  custom:
+    api_key: public
+    base_url: http://127.0.0.1:9000/zen/v1
+sessions:
+  auto_prune: false
+  min_interval_hours: 24
+  retention_days: 90
+  vacuum_after_prune: true
+  write_json_snapshots: false
+streaming:
+  buffer_threshold: 24
+  cursor: ' ▌'
+  edit_interval: 0.8
+  enabled: false
+  fresh_final_after_seconds: 0
+  transport: auto
+telegram:
+  allowed_chats: 7311515527, 2027990099, -5514910899, 7813687414
+  extra:
+    guest_mode: false
+    mention_patterns:
+      - (?i)@Marselubuntubot|марсель|marcel
+    require_mention: true
+    rich_messages: true
+  reactions: false
+terminal:
+  auto_source_bashrc: true
+  backend: local
+  cwd: .
+  timeout: 180
+toolsets:
+  - hermes-cli
+stt:
+  local:
+    language: ru
+    model: base
+tts:
+  provider: piper
+  piper:
+    voice: ru_RU-dmitri-medium
+    length_scale: 1.2

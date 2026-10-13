@@ -1,0 +1,245 @@
+diff --git a/agent/error_classifier.py b/agent/error_classifier.py
+index 7bcfbaf0c..398804ae9 100644
+--- a/agent/error_classifier.py
++++ b/agent/error_classifier.py
+@@ -1659,6 +1659,7 @@ def _classify_400(
+             and "could not be verified" in error_msg
+         )
+         or "could not decrypt the provided encrypted_content" in error_msg
++        or "not issued to this caller" in error_msg
+     ):
+         return result_fn(
+             FailoverReason.invalid_encrypted_content,
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index 926bd1b84..067d12e77 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -5633,7 +5633,7 @@ def normalize_opencode_model_id(provider_id: Optional[str], model_id: Optional[s
+ # the free tier at all: "Model x is not supported").
+ # Verified live 2026-08-21 against POST /zen/v1/chat/completions.
+ OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER = "opencode-zen-free-keyless"
+-_OPENCODE_ZEN_FREE_BASE_URL = "https://opencode.ai/zen/v1"
++_OPENCODE_ZEN_FREE_BASE_URL = os.environ.get("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
+ 
+ # Free-tier models whose slug does NOT carry the ``-free`` suffix.
+ # (big-pickle is OpenCode's rotating free stealth slot.)
+diff --git a/package-lock.json b/package-lock.json
+index 5e1f45ced..9ce552bf5 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -2137,7 +2137,6 @@
+       "os": [
+         "aix"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2154,7 +2153,6 @@
+       "os": [
+         "android"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2171,7 +2169,6 @@
+       "os": [
+         "android"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2188,7 +2185,6 @@
+       "os": [
+         "android"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2205,7 +2201,6 @@
+       "os": [
+         "darwin"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2222,7 +2217,6 @@
+       "os": [
+         "darwin"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2239,7 +2233,6 @@
+       "os": [
+         "freebsd"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2256,7 +2249,6 @@
+       "os": [
+         "freebsd"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2273,7 +2265,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2290,7 +2281,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2307,7 +2297,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2324,7 +2313,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2341,7 +2329,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2358,7 +2345,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2375,7 +2361,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2392,7 +2377,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2409,7 +2393,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2426,7 +2409,6 @@
+       "os": [
+         "netbsd"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2443,7 +2425,6 @@
+       "os": [
+         "netbsd"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2460,7 +2441,6 @@
+       "os": [
+         "openbsd"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2477,7 +2457,6 @@
+       "os": [
+         "openbsd"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2494,7 +2473,6 @@
+       "os": [
+         "openharmony"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2511,7 +2489,6 @@
+       "os": [
+         "sunos"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2528,7 +2505,6 @@
+       "os": [
+         "win32"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2545,7 +2521,6 @@
+       "os": [
+         "win32"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2562,7 +2537,6 @@
+       "os": [
+         "win32"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -18047,7 +18021,6 @@
+       "os": [
+         "darwin"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
+       }
