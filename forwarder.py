@@ -243,7 +243,46 @@ _KNOWN_OPENCODE_MODELS = _load_known_opencode_models()
 _rotate_lock = threading.Lock()
 
 _SESSION_PIN_LOCK = threading.Lock()
-_SESSION_PINS = {}  # stable key (prompt_cache_key) -> sticky x-opencode-session id
+_PINS_FILE = os.path.join(BASE_DIR, "session_pins.json")
+_SESSION_PINS_CAP = 5000
+
+
+def _load_session_pins():
+    """Restore prompt_cache_key -> ses_ pins surviving forwarder restarts.
+
+    Without this, every forwarder restart (incl. machine reboot) remaps all
+    conversations to fresh ses_ ids and upstream 400s the sealed
+    reasoning.encrypted_content replayed under the new caller (fix 2026-10-13).
+    """
+    try:
+        with open(_PINS_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            pins = {str(k): str(v) for k, v in data.items()
+                    if k and v and str(v).startswith("ses_")}
+            if len(pins) > _SESSION_PINS_CAP:
+                pins = dict(list(pins.items())[-_SESSION_PINS_CAP:])
+            log.info(f"session pins restored: {len(pins)} from {_PINS_FILE}")
+            return pins
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"session pins load failed: {e}")
+    return {}
+
+
+def _save_session_pins():
+    """Atomic persist; called only when a NEW pin is added (not per hit)."""
+    try:
+        tmp = _PINS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_SESSION_PINS, f)
+        os.replace(tmp, _PINS_FILE)
+    except Exception as e:
+        log.warning(f"session pins save failed: {e}")
+
+
+_SESSION_PINS = _load_session_pins()  # stable key (prompt_cache_key) -> sticky x-opencode-session id
 
 _HEX = "0123456789abcdef"
 _ALNUM = string.ascii_letters + string.digits
@@ -284,8 +323,9 @@ def _sticky_session_for(body):
         if not sess:
             sess = _new_session_id()
             _SESSION_PINS[key] = sess
-            if len(_SESSION_PINS) > 5000:
+            if len(_SESSION_PINS) > _SESSION_PINS_CAP:
                 _SESSION_PINS.pop(next(iter(_SESSION_PINS)))
+            _save_session_pins()
     return sess
 
 
@@ -452,6 +492,34 @@ def renew_tor_ip():
         return False
     finally:
         _rotate_lock.release()
+
+
+_START_TIME = time.time()
+
+
+def _boot_grace_left():
+    try:
+        grace = float(os.environ.get("FORWARDER_BOOT_GRACE_SEC", "90"))
+    except Exception:
+        grace = 90
+    return max(0.0, grace - (time.time() - _START_TIME))
+
+
+def rotate_or_wait(context):
+    """Rotate Tor exit on transport errors — unless we just (re)started.
+
+    During the boot grace (Tor still building circuits after a reboot),
+    NEWNYM is harmful: it discards bootstrapping circuits and prolongs
+    the outage. Wait a few seconds and retry on the same circuit instead.
+    Returns True when a rotation was actually performed.
+    """
+    left = _boot_grace_left()
+    if left > 0:
+        wait = min(5.0, left)
+        log.warning(f"{context}: boot grace ({left:.0f}s left), waiting {wait:.0f}s instead of NEWNYM")
+        time.sleep(wait)
+        return False
+    return bool(renew_tor_ip())
 
 
 def get_tor_ip():
@@ -1948,7 +2016,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if attempt < RETRY_ATTEMPTS - 1:
                     log.warning("Timeout detected, rotating Tor IP and retrying...")
                     if not rotated:
-                        rotated = renew_tor_ip()
+                        rotated = rotate_or_wait("Timeout")
                     continue
                 self.send_error(502, "Forwarder Error: Upstream timeout")
                 return
@@ -1957,7 +2025,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if attempt < RETRY_ATTEMPTS - 1:
                     log.warning("ProxyError detected, rotating Tor IP and retrying...")
                     if not rotated:
-                        rotated = renew_tor_ip()
+                        rotated = rotate_or_wait("ProxyError")
                     continue
                 self.send_error(502, "Forwarder Error: Proxy failed")
                 return
@@ -1966,7 +2034,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if attempt < RETRY_ATTEMPTS - 1:
                     log.warning("ConnectionError detected, rotating Tor IP and retrying...")
                     if not rotated:
-                        rotated = renew_tor_ip()
+                        rotated = rotate_or_wait("ConnectionError")
                     continue
                 self.send_error(502, "Forwarder Error: Connection failed")
                 return
@@ -2202,8 +2270,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if not sess:
                 sess = _new_session_id()
                 _SESSION_PINS[conv_key] = sess
-                if len(_SESSION_PINS) > 5000:
+                if len(_SESSION_PINS) > _SESSION_PINS_CAP:
                     _SESSION_PINS.pop(next(iter(_SESSION_PINS)))
+                _save_session_pins()
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in FORBIDDEN_HEADERS}
         headers["User-Agent"] = UPSTREAM_UA
@@ -2584,7 +2653,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 log.error("anthropic: upstream timeout")
                 if attempt < RETRY_ATTEMPTS - 1:
                     if not rotated:
-                        rotated = renew_tor_ip()
+                        rotated = rotate_or_wait("anthropic timeout")
                     continue
                 self.send_anthropic_error(502, "api_error", "Upstream timeout")
                 return
@@ -2592,7 +2661,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 log.error(f"anthropic: proxy error: {e}")
                 if attempt < RETRY_ATTEMPTS - 1:
                     if not rotated:
-                        rotated = renew_tor_ip()
+                        rotated = rotate_or_wait("anthropic proxy error")
                     continue
                 self.send_anthropic_error(502, "api_error", "Proxy failed")
                 return
@@ -2600,7 +2669,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 log.error(f"anthropic: connection error: {e}")
                 if attempt < RETRY_ATTEMPTS - 1:
                     if not rotated:
-                        rotated = renew_tor_ip()
+                        rotated = rotate_or_wait("anthropic connection error")
                     continue
                 self.send_anthropic_error(502, "api_error", "Connection failed")
                 return
