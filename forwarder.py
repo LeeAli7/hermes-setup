@@ -1,4 +1,4 @@
-import json, os, sys, logging, threading, time, socket, binascii, uuid, secrets, string, copy
+import json, os, re, sys, logging, threading, time, socket, binascii, uuid, secrets, string, copy
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import requests, urllib3
@@ -164,6 +164,63 @@ def _is_protocol_error(snippet):
     s = (snippet or "").lower()
     return "modelprotocolunsupported" in s.replace(" ", "") or \
         ("does not support this protocol" in s)
+
+
+# --- Sealed encrypted-reasoning 400s (fix 2026-10-13) ---
+# Upstream seals reasoning.encrypted_content to the caller session that
+# received it. Replaying it under a different x-opencode-session (typical
+# right after a gateway restart or a sticky-session remap) fails with 400.
+# Markers observed live: "reasoning `encrypted_content` has expired"
+# (opencode.ai responses API), "not issued to this caller" / "could not
+# decrypt the provided encrypted_content" (gateway-side classifier).
+_SEALED_400_MARKERS = (
+    "not issued to this caller",
+    "was not issued",
+    "could not decrypt the provided encrypted_content",
+    "has expired",
+    "encrypted_content",
+)
+
+
+def _is_sealed_400(snippet):
+    s = (snippet or "").lower()
+    return any(m in s for m in _SEALED_400_MARKERS)
+
+
+def _redact_error_snippet(snippet):
+    """Strip possible secrets from an upstream error body before logging."""
+    try:
+        s = re.sub(r"(?i)(bearer\s+)[^\s\"'}]+", r"\1REDACTED", snippet or "")
+        s = re.sub(r"\bsk-[A-Za-z0-9_\-]{8,}", "sk-REDACTED", s)
+        return s
+    except Exception:
+        return snippet or ""
+
+
+def _read_error_snippet(resp, limit=400):
+    """Read an error body for logging.
+
+    Returns (snippet_str, cached_bytes_or_None). Forged-TLS responses are
+    one-shot iterators: reading .text consumes the socket stream, so the
+    caller must deliver `cached_bytes` downstream instead of streaming
+    `resp` again (otherwise the client gets headers + empty body, which
+    surfaces as RemoteProtocolError 0-bytes-vs-Content-Length).
+    """
+    try:
+        praw = getattr(resp, "text", None)
+        if isinstance(praw, bytes):
+            return praw[:limit].decode("utf-8", "replace"), praw
+        if isinstance(praw, str):
+            return praw[:limit], praw.encode("utf-8", "replace")
+    except Exception:
+        pass
+    try:
+        content = resp.content
+        if isinstance(content, bytes):
+            return (content[:limit] or b"").decode("utf-8", "replace"), content
+    except Exception:
+        pass
+    return "", None
 
 # --- Anthropic bridge (Claude Code via POST /v1/messages) ---
 ANTHROPIC_DEFAULT_MODEL = os.environ.get(
@@ -846,6 +903,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
             pass
         finally:
             resp.close()
+
+    def passthrough_cached(self, resp, cached):
+        """Deliver an error response whose body was already consumed for
+        sniffing (one-shot forged-TLS iterator). Sends the cached bytes
+        with a correct Content-Length so the client sees the real upstream
+        400 JSON instead of a truncated body (RemoteProtocolError)."""
+        data = bytes(cached) if isinstance(cached, (bytes, bytearray)) else b""
+        try:
+            ctype = resp.headers.get("Content-Type", "application/json")
+        except Exception:
+            ctype = "application/json"
+        try:
+            self.send_response(resp.status_code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if data:
+                self.wfile.write(data)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
     def translate_chat_stream_to_responses(self, resp, model):
         """Chat-completions SSE -> Responses SSE, streamed to the client.
@@ -1724,21 +1807,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     # client already receives today (chat SSE / chat JSON).
                     if (resp.status_code == 400 and url.endswith("/responses")
                             and "/responses" in self.path):
-                        try:
-                            # ForgedResponse has .text (no .content);
-                            # requests has both. Try .text first.
-                            _praw = getattr(resp, "text", None)
-                            if isinstance(_praw, bytes):
-                                _psnip = _praw[:400].decode("utf-8", "replace")
-                            elif isinstance(_praw, str):
-                                _psnip = _praw[:400]
-                            else:
-                                _psnip = ""
-                            if not _psnip:
-                                _psnip = (resp.content[:400] or b"").decode(
-                                    "utf-8", "replace")
-                        except Exception:
-                            _psnip = ""
+                        # F-A: always log the upstream 400 text (redacted).
+                        # Previously only the status code was logged, so every
+                        # 400 surfaced downstream as generic "provider failed".
+                        _psnip, _cached = _read_error_snippet(resp)
+                        if _psnip:
+                            log.warning(f"upstream 400 body for {self.path} model={current_model}: {_redact_error_snippet(_psnip)}")
                         if _is_protocol_error(_psnip):
                             try:
                                 resp.close()
@@ -1795,6 +1869,59 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                 return
                             except Exception as _fe:
                                 log.warning(f"chat fallback failed for model={current_model}: {_fe}")
+                        # F-B: sealed encrypted_content 400 -> retry ONCE
+                        # without requesting encrypted content. The replayed
+                        # reasoning items (if any) stay in `input`; if upstream
+                        # still rejects them, the intact 400 below lets the
+                        # gateway-side recovery strip them and retry.
+                        if _is_sealed_400(_psnip):
+                            try:
+                                _sobj = json.loads(body) if body else {}
+                                if isinstance(_sobj, dict):
+                                    _inc = _sobj.get("include")
+                                    if isinstance(_inc, list):
+                                        _sobj["include"] = [
+                                            i for i in _inc
+                                            if i != "reasoning.encrypted_content"]
+                                    elif "include" in _sobj:
+                                        _sobj.pop("include", None)
+                                    _sbody = json.dumps(_sobj).encode()
+                                    try:
+                                        headers["x-opencode-request"] = _new_request_id()
+                                    except Exception:
+                                        pass
+                                    log.warning(f"sealed-400 retry without include for model={current_model}")
+                                    _sresp = self.attempt(method, url, _sbody,
+                                                          headers, get_proxy())
+                                    if _sresp.status_code == 200:
+                                        log.info(f"Response: 200 for {self.path} model={current_model} (sealed retry)")
+                                        _spsnip, _scached = "", None
+                                    else:
+                                        _spsnip, _scached = _read_error_snippet(_sresp)
+                                        if _spsnip:
+                                            log.warning(f"sealed retry -> {_sresp.status_code} for {self.path} model={current_model}: {_redact_error_snippet(_spsnip)}")
+                                        else:
+                                            log.info(f"Response: {_sresp.status_code} for {self.path} model={current_model} (sealed retry)")
+                                    try:
+                                        resp.close()
+                                    except Exception:
+                                        pass
+                                    resp, _psnip, _cached, body = _sresp, _spsnip, _scached, _sbody
+                            except Exception as _se:
+                                log.warning(f"sealed-400 retry failed for model={current_model}: {_se}")
+                        # F-C: deliver non-200 intact. Forged-TLS bodies are
+                        # one-shot: the sniff above already consumed the
+                        # socket stream, so streaming `resp` again would send
+                        # headers + empty body (client sees RemoteProtocolError
+                        # "0 bytes, expected N" instead of the real 400 JSON).
+                        if resp.status_code != 200:
+                            if getattr(resp, "_text_cache", None) is not None and _cached is not None:
+                                self.passthrough_cached(resp, _cached)
+                            else:
+                                self.passthrough(resp)
+                            return
+                        # 200 after sealed retry: fall through to the
+                        # translators below with the retried body/flags.
                     if use_responses_api and resp.status_code == 200:
                         is_stream = responses_client_stream
                         if is_stream:
