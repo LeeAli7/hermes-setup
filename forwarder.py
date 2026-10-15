@@ -65,6 +65,22 @@ logging.basicConfig(
 log = logging.getLogger("forwarder")
 
 UPSTREAM_BASE = os.environ.get("UPSTREAM_BASE", "https://opencode.ai")
+
+
+def _zen_to_inference(path):
+    """Rewrite legacy /zen/* outbound paths to the new /inference/* family.
+
+    2026-10-15 (verified live): opencode.ai moved the free tier to
+    /inference/v1/*. Legacy /zen/v1/* chat families now return
+    403 FreeTierError for every caller — Tor exit, UA, bearer, toolset
+    are all irrelevant; the path alone is the gate. The /zen/v1/models
+    catalog still works, so it is NOT remapped.
+    """
+    if path.startswith("/zen/v1/models"):
+        return path
+    if path.startswith("/zen/"):
+        return "/inference/" + path[len("/zen/"):]
+    return path
 CONTROL_PORT = 9051
 SOCKS_PORT = 9050
 UPSTREAM_READ_TIMEOUT = 300  # upstream response timeout (seconds)
@@ -1080,7 +1096,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_length)
             log.info(f"Body read: {len(body)} bytes for {method} {self.path}")
 
-        url = UPSTREAM_BASE + self.path
+        upstream_path = _zen_to_inference(self.path)
+        url = UPSTREAM_BASE + upstream_path
         headers = {k: v for k, v in self.headers.items() if k.lower() not in FORBIDDEN_HEADERS}
         headers["User-Agent"] = UPSTREAM_UA
         # Always overwrite: Hermes sends its placeholder bearer (401s) and
@@ -1136,7 +1153,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if r_tc:
                     responses_body["tool_choice"] = r_tc
                 body = json.dumps(responses_body).encode()
-                url = UPSTREAM_BASE + "/zen/v1/responses"
+                url = UPSTREAM_BASE + _zen_to_inference("/zen/v1/responses")
                 log.info(f"Converted chat/completions -> responses API for model={current_model}")
             except Exception as e:
                 log.warning(f"Failed to convert to responses API: {e}")
