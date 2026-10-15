@@ -378,17 +378,36 @@ RESPONSES_BODY_DEFAULTS = {
     "include": ["reasoning.encrypted_content"],
 }
 
-# Minimal CLI tool defs (names must match exactly; descriptions/params can
-# be minimal — verified 18.09.2026). Appended to responses-bound requests
-# missing CLI-known tools so the shape gate passes. ~450 bytes overhead.
-CLI_DECOY_TOOLS = [
-    {"type": "function", "name": "bash", "description": "Shell command execution",
-     "parameters": {"type": "object", "properties": {}}},
-    {"type": "function", "name": "edit", "description": "File editing",
-     "parameters": {"type": "object", "properties": {}}},
-    {"type": "function", "name": "read", "description": "File reading",
-     "parameters": {"type": "object", "properties": {}}},
-]
+# CLI tool defs for the shape gate. 2026-10-15: upstream also validates
+# realistic descriptions/schemas — minimal stubs (description "d",
+# empty params) now 403 FreeTierError even with the right names.
+# Full CLI defs live in real_tools.json (captured verbatim from real
+# opencode CLI); inline stubs below are only a fallback if the file
+# is missing.
+_REAL_TOOLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "real_tools.json")
+
+
+def _load_real_tools():
+    try:
+        with open(_REAL_TOOLS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list) and all(
+                isinstance(t, dict) and t.get("name") for t in data):
+            return data
+    except Exception as e:
+        log.warning(f"real tools load failed: {e}")
+    return [
+        {"type": "function", "name": "bash", "description": "Shell command execution",
+         "parameters": {"type": "object", "properties": {}}},
+        {"type": "function", "name": "edit", "description": "File editing",
+         "parameters": {"type": "object", "properties": {}}},
+        {"type": "function", "name": "read", "description": "File reading",
+         "parameters": {"type": "object", "properties": {}}},
+    ]
+
+
+CLI_DECOY_TOOLS = _load_real_tools()
 
 
 def pad_responses_body(body_bytes):
