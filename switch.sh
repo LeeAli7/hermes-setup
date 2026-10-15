@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-HERMES="/home/ubuntu/.hermes/hermes-agent/venv/bin/hermes"
+HERMES="$HOME/.hermes/hermes-agent/venv/bin/hermes"
 STATE="$HOME/.config/hermes-switch.state"
 
 # --- Live free models (auto-refresh, см. refresh-free-models.sh) ---

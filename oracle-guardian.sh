@@ -57,9 +57,9 @@ check_disk() {
     if [ "$usage" -gt "$MAX_DISK_CRITICAL" ]; then
         alert "DISK CRITICAL: ${usage}% — cleaning up"
         find /tmp -name "*.log" -mtime +3 -delete 2>/dev/null
-        find /home/ubuntu/.hermes/logs -name "*.log" -mtime +3 -delete 2>/dev/null
+        find "$HOME/.hermes/logs" -name "*.log" -mtime +3 -delete 2>/dev/null
         journalctl --vacuum-time=2d 2>/dev/null
-        find /home/ubuntu/.hermes/sessions -name "*.jsonl" -mtime +30 -delete 2>/dev/null
+        find "$HOME/.hermes/sessions" -name "*.jsonl" -mtime +30 -delete 2>/dev/null
         log "Disk cleanup performed"
     elif [ "$usage" -gt "$MAX_DISK_PERCENT" ]; then
         log "DISK WARNING: ${usage}%"
