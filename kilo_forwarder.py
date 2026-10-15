@@ -47,6 +47,19 @@ KILO_ANTHROPIC_DEFAULT_MODEL = os.environ.get(
 KILO_PUBLIC_API_KEY = os.environ.get("FORWARDER_API_KEY", "").strip()
 LOOPBACK_IPS = {"127.0.0.1", "::1"}
 
+
+def _query_flag(path, name, default=True):
+    """Query flag with default (beta defaults ON; ?beta=false/0 disables)."""
+    try:
+        q = path.split("?", 1)[1] if "?" in path else ""
+        for part in q.split("&"):
+            k, _, v = part.partition("=")
+            if k.strip() == name:
+                return v.strip().lower() not in ("0", "false", "no", "off")
+        return default
+    except Exception:
+        return default
+
 def _load_known_kilo_models():
     try:
         with open(os.path.join(BASE_DIR, "free-models", "kilo.txt")) as f:
@@ -248,7 +261,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return True
         if not KILO_PUBLIC_API_KEY:
             return True  # open mode: no key configured
-        if self.headers.get("Authorization", "") == f"Bearer {KILO_PUBLIC_API_KEY}":
+        _auth_ok = (
+            self.headers.get("Authorization", "") == f"Bearer {KILO_PUBLIC_API_KEY}"
+            or (self.headers.get("x-api-key", "") or "").strip() == KILO_PUBLIC_API_KEY
+        )
+        if _auth_ok:
             return True
         try:
             body = b'{"type":"error","error":{"type":"authentication_error","message":"Invalid or missing API key"}}'
@@ -523,6 +540,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
         url = UPSTREAM_BASE + "/api/openrouter/chat/completions"
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in FORBIDDEN_HEADERS}
+        # Never forward the client's public Bearer upstream: api.kilo.ai
+        # validates it as its own token -> 401 INVALID_TOKEN (Claude sends
+        # both x-api-key and Bearer by default). x-api-key passes through.
+        for _ak in [k for k in headers if k.lower() == "authorization"]:
+            headers.pop(_ak, None)
+        # beta handling is default-ON: plain /v1/messages behaves like
+        # ?beta=true (kept for compat); ?beta=false/0 opts out and strips
+        # Anthropic beta-negotiation headers before upstream.
+        _beta_on = _query_flag(self.path, "beta", True)
+        if _beta_on:
+            log.info(f"kilo-anthropic: beta mode on for model={up_model}")
+        else:
+            for _hk in [k for k in headers if k.lower() in ("anthropic-beta", "anthropic-version")]:
+                headers.pop(_hk, None)
+            log.info(f"kilo-anthropic: beta mode off (?beta=false) for model={up_model}, stripped beta headers")
 
         def _rebuild_kilo_body(strip_reasoning=False, strip_tools=False,
                                clamp_max=False, truncate_msgs=None):

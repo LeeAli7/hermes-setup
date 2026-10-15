@@ -25,7 +25,7 @@ def _forge_attempt(method, url, body, headers, proxy=None,
     """
     get = lambda k, d="": headers.get(k, headers.get(k.title(), d))
     ordered = [
-        ("Authorization", get("authorization", "Bearer public")),
+        ("Authorization", get("authorization", "")),
         ("Content-Type", get("content-type", "application/json")),
         ("User-Agent", get("user-agent", UPSTREAM_UA)),
         ("x-opencode-client", get("x-opencode-client", "cli")),
@@ -35,7 +35,7 @@ def _forge_attempt(method, url, body, headers, proxy=None,
         ("Connection", "keep-alive"),
         ("Accept", "*/*"),
         ("Host", "opencode.ai"),
-        ("Accept-Encoding", "gzip, deflate"),
+        ("Accept-Encoding", get("accept-encoding", "gzip, deflate, br, zstd")),
     ]
     ordered = [(k, v) for k, v in ordered if v != ""]
     socks = None
@@ -67,6 +67,23 @@ logging.basicConfig(
 log = logging.getLogger("forwarder")
 
 UPSTREAM_BASE = os.environ.get("UPSTREAM_BASE", "https://opencode.ai")
+
+
+def _zen_to_inference(path):
+    """Rewrite legacy /zen/* outbound paths to the new /inference/* family.
+
+    2026-10-15 (verified live): opencode.ai moved the free tier to
+    /inference/v1/*. The legacy /zen/v1/* family now returns
+    403 FreeTierError ("can only be used from within OpenCode") for EVERY
+    caller — Tor exit IP, UA, bearer, toolset all irrelevant; the path alone
+    is the gate. /zen/v1/models (the catalog) still works, so only the
+    chat/completions + responses families move.
+    """
+    if path.startswith("/zen/v1/models"):
+        return path
+    if path.startswith("/zen/"):
+        return "/inference/" + path[len("/zen/"):]
+    return path
 CONTROL_PORT = 9051
 SOCKS_PORT = 9050
 UPSTREAM_READ_TIMEOUT = 300  # upstream response timeout (seconds)
@@ -101,11 +118,26 @@ FALLBACK_MODELS = [m.strip() for m in os.environ.get(
 # headers -> 403. Wrong bearer (e.g. Hermes' placeholder) -> 401.
 UPSTREAM_UA = os.environ.get(
     "FORWARDER_UA",
-    "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
+    "opencode/1.18.32 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
 )
 # Literal public bearer the official CLI sends. ALWAYS overwritten outbound:
 # Hermes sends its own placeholder (opencode-zen-free-keyless) which 401s.
+# 2026-10-15: default BACK to "Bearer public" — the new /inference/* family
+# REQUIRES it (empty header -> 403 FreeTierError, verified live on
+# /inference/v1/responses). The 14.10 "empty" experiment only ever applied to
+# the legacy /zen path, which is now closed anyway.
 UPSTREAM_BEARER = os.environ.get("FORWARDER_UPSTREAM_BEARER", "Bearer public")
+
+
+def _apply_upstream_auth(headers):
+    """Mirror the real CLI: no Authorization header on keyless calls.
+
+    A stale/placeholder inbound bearer must never leak upstream either.
+    """
+    headers.pop("Authorization", None)
+    if UPSTREAM_BEARER:
+        headers["Authorization"] = UPSTREAM_BEARER
+    return headers
 SPOOF_SYSTEM_MARKER = os.environ.get("FORWARDER_SYSTEM_MARKER", "1") == "1"
 SYSTEM_MARKER = os.environ.get("FORWARDER_SYSTEM_MARKER_TEXT", "You are opencode.")
 
@@ -114,9 +146,23 @@ FORBIDDEN_HEADERS = {"host", "content-length", "transfer-encoding", "connection"
 # --- public API key auth (from Marsel, keeps cloudflared tunnel protected) ---
 # Localhost (127.0.0.1 / ::1) is always allowed (local Hermes gateway, keyless provider).
 # Remote clients must send:  Authorization: Bearer $FORWARDER_API_KEY
+#   or x-api-key: $FORWARDER_API_KEY (Anthropic SDKs / Claude Code style).
 # Remote clients are also restricted to /zen/* API paths (+ /health).
 PUBLIC_API_KEY = os.environ.get("FORWARDER_API_KEY", "").strip()
 LOOPBACK_IPS = {"127.0.0.1", "::1"}
+
+
+def _query_flag(path, name, default=True):
+    """Query flag with default (beta defaults ON; ?beta=false/0 disables)."""
+    try:
+        q = path.split("?", 1)[1] if "?" in path else ""
+        for part in q.split("&"):
+            k, _, v = part.partition("=")
+            if k.strip() == name:
+                return v.strip().lower() not in ("0", "false", "no", "off")
+        return default
+    except Exception:
+        return default
 
 # --- Per-model upstream protocol cache (universal, no hardcoded allowlist) ---
 # Matrix 2026-10-11: only spark-1.2/1.3 speak responses; everything else is
@@ -557,14 +603,45 @@ RESPONSES_BODY_DEFAULTS = {
 # Minimal CLI tool defs (names must match exactly; descriptions/params can
 # be minimal — verified 18.09.2026). Appended to responses-bound requests
 # missing CLI-known tools so the shape gate passes. ~450 bytes overhead.
-CLI_DECOY_TOOLS = [
-    {"type": "function", "name": "bash", "description": "Shell command execution",
-     "parameters": {"type": "object", "properties": {}}},
-    {"type": "function", "name": "edit", "description": "File editing",
-     "parameters": {"type": "object", "properties": {}}},
-    {"type": "function", "name": "read", "description": "File reading",
-     "parameters": {"type": "object", "properties": {}}},
-]
+# 2026-10-14: upstream tightened the gate to the {bash, glob, grep, read}
+# quartet (all agents globally 403 FreeTierError without glob+grep);
+# edit kept (real CLI also declares it).
+# Full CLI tool defs, captured verbatim from real opencode 1.18.32
+# (custom provider -> local dump, main turn 2026-10-14). Upstream shape
+# gate validates tool names + realistic descriptions/schemas; minimal
+# stubs (description "d", empty params) now 403 FreeTierError.
+_REAL_TOOLS_FILE = os.path.join(BASE_DIR, "real_tools.json")
+
+
+def _load_real_tools():
+    try:
+        with open(_REAL_TOOLS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list) and all(
+                isinstance(t, dict) and t.get("name") for t in data):
+            log.info(f"real tool defs loaded: {len(data)} from {_REAL_TOOLS_FILE}")
+            return data
+    except Exception as e:
+        log.warning(f"real tools load failed: {e}")
+    return [
+        {"type": "function", "name": n, "description": "d",
+         "parameters": {"type": "object", "properties": {}}}
+        for n in ("bash", "glob", "grep", "edit", "read")]
+
+
+CLI_DECOY_TOOLS = _load_real_tools()
+
+
+def _chat_decoy(name):
+    """Full-fidelity chat-format decoy (verbatim CLI description+schema)."""
+    for t in CLI_DECOY_TOOLS:
+        if t.get("name") == name:
+            return {"type": "function", "function": {
+                "name": name, "description": t.get("description") or "d",
+                "parameters": t.get("parameters") or {"type": "object", "properties": {}}}}
+    return {"type": "function", "function": {
+        "name": name, "description": "d",
+        "parameters": {"type": "object", "properties": {}}}}
 
 
 def pad_responses_body(body_bytes):
@@ -1654,7 +1731,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return True
         if not PUBLIC_API_KEY:
             return True  # open mode: no key configured
-        if self.headers.get("Authorization", "") == f"Bearer {PUBLIC_API_KEY}":
+        _auth_ok = (
+            self.headers.get("Authorization", "") == f"Bearer {PUBLIC_API_KEY}"
+            or (self.headers.get("x-api-key", "") or "").strip() == PUBLIC_API_KEY
+        )
+        if _auth_ok:
             if not (self.path.startswith("/zen/") or self.path.startswith("/v1/")):
                 try:
                     self.send_response(404)
@@ -1701,12 +1782,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.path == "/zen/v1/models" or self.path.startswith("/zen/v1/models?")):
             self.handle_filtered_openai_models()
             return
-        url = UPSTREAM_BASE + self.path
+        # 2026-10-15: opencode.ai migrated the free tier to a NEW endpoint
+        # family /inference/* (verified live: /inference/v1/responses = 200,
+        # legacy /zen/v1/responses = 403 FreeTierError for everyone, from any
+        # Tor exit, any UA, any bearer). The path alone is the gate.
+        # Inbound clients keep asking for /zen/* (public contract), so we
+        # rewrite the outbound path one-for-one.
+        upstream_path = _zen_to_inference(self.path)
+        url = UPSTREAM_BASE + upstream_path
         headers = {k: v for k, v in self.headers.items() if k.lower() not in FORBIDDEN_HEADERS}
         headers["User-Agent"] = UPSTREAM_UA
-        # Always overwrite: Hermes sends its placeholder bearer (401s) and
-        # no/UUID session headers (403s). Exact CLI shape, verified 17.09.2026.
-        headers["Authorization"] = UPSTREAM_BEARER
+        # Real CLI sends no Authorization on keyless calls; Hermes'
+        # placeholder bearer (401s) and no/UUID session headers (403s)
+        # must never leak upstream. Exact CLI shape, verified 17.09.2026,
+        # auth updated 14.10.2026 (literal "Bearer public" now 403s).
+        _apply_upstream_auth(headers)
         headers["x-opencode-client"] = "cli"
         headers["x-opencode-project"] = "global"
         headers["x-opencode-request"] = _new_request_id()
@@ -1757,7 +1847,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if r_tc:
                     responses_body["tool_choice"] = r_tc
                 body = json.dumps(responses_body).encode()
-                url = UPSTREAM_BASE + "/zen/v1/responses"
+                url = UPSTREAM_BASE + _zen_to_inference("/zen/v1/responses")
                 log.info(f"Converted chat/completions -> responses API for model={current_model}")
             except Exception as e:
                 log.warning(f"Failed to convert to responses API: {e}")
@@ -1828,11 +1918,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                 have.add(fn["name"])
                             elif t.get("name"):
                                 have.add(t["name"])
-                    for name in ("bash", "edit", "read"):
+                    for name in ("bash", "glob", "grep", "edit", "read"):
                         if name not in have:
-                            ct.append({"type": "function", "function": {
-                                "name": name, "description": "d",
-                                "parameters": {"type": "object", "properties": {}}}})
+                            ct.append(_chat_decoy(name))
                             added = True
                     if "tool_choice" not in cj:
                         cj["tool_choice"] = "auto"
@@ -1846,7 +1934,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         rotated = False
         for attempt in range(RETRY_ATTEMPTS):
             proxy = get_proxy()
-            log.info(f"Request: {method} {self.path} attempt={attempt+1}/{RETRY_ATTEMPTS} proxy={proxy} model={current_model}")
+            log.info(f"Request: {method} {url} attempt={attempt+1}/{RETRY_ATTEMPTS} proxy={proxy} model={current_model}")
             try:
                 resp = self.attempt(method, url, body, headers, proxy)
 
@@ -1900,13 +1988,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                            if isinstance(_t.get("function"), dict) else {})
                                     if _fn.get("name"):
                                         _have.add(_fn["name"])
-                                for _n in ("bash", "edit", "read"):
+                                for _n in ("bash", "glob", "grep", "edit", "read"):
                                     if _n not in _have:
-                                        _ct.append({"type": "function",
-                                                    "function": {
-                                                        "name": _n, "description": "d",
-                                                        "parameters": {"type": "object",
-                                                                       "properties": {}}}})
+                                        _ct.append(_chat_decoy(_n))
                                 if "tool_choice" not in _chat:
                                     _chat["tool_choice"] = "auto"
                                 _msgs = _chat.get("messages") or []
@@ -1917,7 +2001,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                                    "content": SYSTEM_MARKER})
                                     _chat["messages"] = _msgs
                                 _cbody = json.dumps(_chat).encode()
-                                _curl = UPSTREAM_BASE + "/zen/v1/chat/completions"
+                                _curl = UPSTREAM_BASE + _zen_to_inference("/zen/v1/chat/completions")
                                 try:
                                     headers["x-opencode-request"] = _new_request_id()
                                 except Exception:
@@ -2086,10 +2170,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def handle_filtered_openai_models(self):
         """Remote GET /zen/v1/models: upstream payload trimmed to free-only."""
-        headers = {"User-Agent": UPSTREAM_UA, "Authorization": UPSTREAM_BEARER,
+        headers = {"User-Agent": UPSTREAM_UA,
                    "x-opencode-client": "cli", "x-opencode-project": "global",
                    "x-opencode-request": _new_request_id(),
                    "x-opencode-session": _new_session_id()}
+        _apply_upstream_auth(headers)
         data = None
         try:
             resp = self.attempt("GET", UPSTREAM_BASE + "/zen/v1/models", None,
@@ -2195,10 +2280,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_anthropic_error(405, "invalid_request_error",
                                       "Method not allowed, use GET /v1/models")
             return
-        headers = {"User-Agent": UPSTREAM_UA, "Authorization": UPSTREAM_BEARER,
+        headers = {"User-Agent": UPSTREAM_UA,
                    "x-opencode-client": "cli", "x-opencode-project": "global",
                    "x-opencode-request": _new_request_id(),
                    "x-opencode-session": _new_session_id()}
+        _apply_upstream_auth(headers)
         data = None
         try:
             resp = self.attempt("GET", UPSTREAM_BASE + "/zen/v1/models", None,
@@ -2276,11 +2362,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in FORBIDDEN_HEADERS}
         headers["User-Agent"] = UPSTREAM_UA
-        headers["Authorization"] = UPSTREAM_BEARER
+        _apply_upstream_auth(headers)
         headers["x-opencode-client"] = "cli"
         headers["x-opencode-project"] = "global"
         headers["x-opencode-request"] = _new_request_id()
         headers["x-opencode-session"] = sess
+        # beta handling is default-ON: plain /v1/messages behaves like
+        # ?beta=true (kept for compat); ?beta=false/0 opts out and strips
+        # Anthropic beta-negotiation headers before upstream.
+        _beta_on = _query_flag(self.path, "beta", True)
+        if _beta_on:
+            log.info(f"anthropic: beta mode on for model={up_model}")
+        else:
+            for _hk in [k for k in headers if k.lower() in ("anthropic-beta", "anthropic-version")]:
+                headers.pop(_hk, None)
+            log.info(f"anthropic: beta mode off (?beta=false) for model={up_model}, stripped beta headers")
 
         _RESPONSES_MODELS = {"muse-spark-1.3-contributor-free",
                              "muse-spark-1.2-contributor-free"}
@@ -2310,11 +2406,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         have.add(fn["name"])
                     elif t.get("name"):
                         have.add(t["name"])
-            for name in ("bash", "edit", "read"):
+            for name in ("bash", "glob", "grep", "edit", "read"):
                 if name not in have:
-                    ct.append({"type": "function", "function": {
-                        "name": name, "description": "d",
-                        "parameters": {"type": "object", "properties": {}}}})
+                    ct.append(_chat_decoy(name))
             if "tool_choice" not in cj:
                 cj["tool_choice"] = "auto"
             if thinking:
@@ -2332,7 +2426,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             """Drop responses-shape, rebuild as chat-shape. Returns True."""
             nonlocal body, url, use_responses_api
             use_responses_api = False
-            url = UPSTREAM_BASE + "/zen/v1/chat/completions"
+            url = UPSTREAM_BASE + _zen_to_inference("/zen/v1/chat/completions")
             try:
                 body = _build_chat_body()
                 try:
@@ -2346,7 +2440,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 return False
 
         body = json.dumps(chat).encode()
-        url = UPSTREAM_BASE + "/zen/v1/chat/completions"
+        url = UPSTREAM_BASE + _zen_to_inference("/zen/v1/chat/completions")
         if not use_responses_api:
             try:
                 body = _build_chat_body()
@@ -2388,7 +2482,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
                 body = json.dumps(responses_body).encode()
-                url = UPSTREAM_BASE + "/zen/v1/responses"
+                url = UPSTREAM_BASE + _zen_to_inference("/zen/v1/responses")
                 log.info(f"anthropic: converted to responses API for model={up_model}")
             except Exception as e:
                 log.warning(f"anthropic: failed to convert to responses API: {e}")
@@ -2477,7 +2571,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         jb["tools"] = [t for t in tools
                                        if not (((t.get("function") or {})
                                                 if isinstance(t.get("function"), dict)
-                                                else t).get("name") in ("bash", "edit", "read")
+                                                else t).get("name") in ("bash", "glob", "grep", "edit", "read")
                                                and not ((t.get("function") or {})
                                                         if isinstance(t.get("function"), dict)
                                                         else t).get("description"))]
