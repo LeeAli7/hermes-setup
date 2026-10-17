@@ -1,0 +1,11 @@
+[Unit]
+Description=Restore last AI provider on boot
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/projects/hermes/provider-restore.sh
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

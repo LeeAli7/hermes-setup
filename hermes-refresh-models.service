@@ -1,0 +1,6 @@
+[Unit]
+Description=Refresh Hermes free model lists
+
+[Service]
+Type=oneshot
+ExecStart=%h/projects/hermes/refresh-free-models.sh

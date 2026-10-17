@@ -1,0 +1,14 @@
+[Unit]
+Description=Hermes Kilo Forwarder (api.kilo.ai via Tor)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/hermes
+ExecStart=%h/.hermes/hermes-agent/venv/bin/python3 %h/projects/hermes/kilo_forwarder.py 9001
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
