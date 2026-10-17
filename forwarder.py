@@ -32,6 +32,7 @@ def _forge_attempt(method, url, body, headers, proxy=None,
         ("x-opencode-project", get("x-opencode-project", "global")),
         ("x-opencode-request", get("x-opencode-request", "")),
         ("x-opencode-session", get("x-opencode-session", "")),
+        ("x-opencode-session-id", get("x-opencode-session-id", "")),
         ("Connection", "keep-alive"),
         ("Accept", "*/*"),
         ("Host", "opencode.ai"),
@@ -122,6 +123,13 @@ EXIT_BLACKLIST_MAX_ROTATIONS = int(os.environ.get("FORWARDER_EXIT_BLACKLIST_MAX_
 # restores the full sampling budget for partial walls.
 WALL_FAST_ATTEMPTS = int(os.environ.get("FORWARDER_WALL_FAST_ATTEMPTS", "12"))
 WALL_SUCCESS_LOOKBACK = float(os.environ.get("FORWARDER_WALL_SUCCESS_LOOKBACK", "300"))
+# 2026-10-17: opencode began class-blocking ALL Tor exits (403 FreeTierError
+# on every sampled exit; the byte-identical request from a direct IP answers
+# 200). While the block window is hot we ride direct egress; when it expires
+# the next request re-probes Tor (one attempt) and either restores Tor or
+# re-arms the window. FORWARDER_DIRECT_FALLBACK=0 forbids direct egress.
+DIRECT_FALLBACK = os.environ.get("FORWARDER_DIRECT_FALLBACK", "1") == "1"
+TOR_REPROBE_INTERVAL = float(os.environ.get("FORWARDER_TOR_REPROBE_INTERVAL", "600"))
 # Strict mode by default: never swap the requested model. To allow a rescue
 # model after repeated 429s, set FORWARDER_FALLBACK_MODELS="model1,model2".
 FALLBACK_MODELS = [m.strip() for m in os.environ.get(
@@ -135,13 +143,17 @@ FALLBACK_MODELS = [m.strip() for m in os.environ.get(
 #   Authorization: Bearer public (literal!) + current CLI UA +
 #   x-opencode-client: cli + x-opencode-project: global +
 #   x-opencode-session: ses_<9hex>ffe<14alnum> +
+#   x-opencode-session-id: <same value> (required since CLI 1.19.x) +
 #   x-opencode-request: msg_<9hex>001<14alnum>
 # The ses_/msg_ IDs are FORMAT-validated server-side (reverse-engineered from
 # the CLI binary + its local opencode.db). Random UUIDs -> 403. Missing
 # headers -> 403. Wrong bearer (e.g. Hermes' placeholder) -> 401.
+# 2026-10-17: re-captured CLI 1.19.3 (MITM, byte-identical replay): UA bumped
+# 1.18.32 -> 1.19.3 and x-opencode-session-id added — the missing header is
+# the likely cause of the sudden all-403 "wall" once opencode shipped 1.19.x.
 UPSTREAM_UA = os.environ.get(
     "FORWARDER_UA",
-    "opencode/1.18.32 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+    "opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
 )
 # Literal public bearer the official CLI sends. ALWAYS overwritten outbound:
 # Hermes sends its own placeholder (opencode-zen-free-keyless) which 401s.
@@ -443,6 +455,10 @@ def _exit_ip_via(proxy, timeout=4):
 _outcome_lock = threading.Lock()
 _recent_outcomes = []  # list[(ts, ok)] — attempt outcomes across requests
 
+# Tor-class block window (2026-10-17, see DIRECT_FALLBACK above).
+_tor_block_lock = threading.Lock()
+_tor_class_block_until = 0.0
+
 
 def _record_outcome(ok):
     """Track attempt outcomes for the total-wall fast-fail detector."""
@@ -463,6 +479,19 @@ def _wall_fast_mode():
     with _outcome_lock:
         return not any(ok and (now - ts) < WALL_SUCCESS_LOOKBACK
                        for ts, ok in _recent_outcomes)
+
+
+def _tor_block_active():
+    """True while the Tor-class block window is open (ride direct egress)."""
+    with _tor_block_lock:
+        return DIRECT_FALLBACK and time.time() < _tor_class_block_until
+
+
+def _arm_tor_block(seconds):
+    """Arm/refresh the Tor-class block window after a FreeTierError on Tor."""
+    global _tor_class_block_until
+    with _tor_block_lock:
+        _tor_class_block_until = time.time() + seconds
 
 
 def _client_gone(conn):
@@ -1954,6 +1983,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         headers["x-opencode-request"] = _new_request_id()
         _sess = _sticky_session_for(body)
         headers["x-opencode-session"] = _sess
+        headers["x-opencode-session-id"] = _sess
 
         use_responses_api = (
             current_model in RESPONSES_MODELS
@@ -2095,20 +2125,27 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if attempt >= WALL_FAST_ATTEMPTS and _wall_fast_mode():
                 log.warning(f"no 2xx in last {WALL_SUCCESS_LOOKBACK:.0f}s — failing fast after {attempt} attempts for {self.path} model={current_model}")
                 break
-            # Per-IP quotas, Tor-only: every attempt rides its OWN fresh exit
-            # (unique SOCKS isolation key -> new circuit in ~1-2s, no NEWNYM).
-            proxy = _iso_proxy(f"m{attempt}")
-            _attempt_exit = None
-            # Pay for an exit lookup / hop only once we know recent duds and
-            # the wall isn't total (in total-wall mode every exit burns).
-            if _failed_exits and not _wall_fast_mode():
-                for _esc in range(EXIT_BLACKLIST_MAX_ROTATIONS + 1):
-                    _attempt_exit = _exit_ip_via(proxy)
-                    if _attempt_exit and _is_failed_exit(_attempt_exit):
-                        log.warning(f"{self.path} model={current_model}: exit {_attempt_exit} is burned, hopping (escape {_esc + 1}/{EXIT_BLACKLIST_MAX_ROTATIONS})")
-                        proxy = _iso_proxy(f"m{attempt}e{_esc}")
-                        continue
-                    break
+            # Tor-class block (2026-10-17): while the window is hot, ride
+            # direct egress; after it expires the next attempt re-probes Tor.
+            if _tor_block_active():
+                proxy = None
+                _attempt_exit = None
+                log.info(f"tor-class block active — direct egress for {self.path} model={current_model}")
+            else:
+                # Per-IP quotas, Tor-only: every attempt rides its OWN fresh exit
+                # (unique SOCKS isolation key -> new circuit in ~1-2s, no NEWNYM).
+                proxy = _iso_proxy(f"m{attempt}")
+                _attempt_exit = None
+                # Pay for an exit lookup / hop only once we know recent duds and
+                # the wall isn't total (in total-wall mode every exit burns).
+                if _failed_exits and not _wall_fast_mode():
+                    for _esc in range(EXIT_BLACKLIST_MAX_ROTATIONS + 1):
+                        _attempt_exit = _exit_ip_via(proxy)
+                        if _attempt_exit and _is_failed_exit(_attempt_exit):
+                            log.warning(f"{self.path} model={current_model}: exit {_attempt_exit} is burned, hopping (escape {_esc + 1}/{EXIT_BLACKLIST_MAX_ROTATIONS})")
+                            proxy = _iso_proxy(f"m{attempt}e{_esc}")
+                            continue
+                        break
             log.info(f"Request: {method} {url} attempt={attempt+1}/{RETRY_ATTEMPTS} proxy={proxy} exit={_attempt_exit or '?'} model={current_model}")
             try:
                 resp = self.attempt(method, url, body, headers, proxy)
@@ -2128,6 +2165,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         wait = min(RETRY_BACKOFF * (attempt + 1), MAX_BACKOFF)
                         log.warning(f"400 for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
                     elif resp.status_code == 403:
+                        _psnip403, _cached403 = _read_error_snippet(resp)
+                        if (DIRECT_FALLBACK and proxy is not None and _psnip403
+                                and ("FreeTierError" in _psnip403
+                                     or "can only be used from within OpenCode" in _psnip403)):
+                            _arm_tor_block(TOR_REPROBE_INTERVAL)
+                            log.warning(
+                                f"Tor-class FreeTierError for {self.path} model={current_model} "
+                                f"attempt={attempt+1} — Tor class-blocked upstream, riding "
+                                f"direct egress for {TOR_REPROBE_INTERVAL:.0f}s")
+                            resp.close()
+                            continue
                         wait = min(RETRY_BACKOFF * (attempt + 1), MAX_BACKOFF)
                         log.warning(f"403 for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
                     else:
@@ -2568,6 +2616,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         headers["x-opencode-project"] = "global"
         headers["x-opencode-request"] = _new_request_id()
         headers["x-opencode-session"] = sess
+        headers["x-opencode-session-id"] = sess
         # beta handling is default-ON: plain /v1/messages behaves like
         # ?beta=true (kept for compat); ?beta=false/0 opts out and strips
         # Anthropic beta-negotiation headers before upstream.
