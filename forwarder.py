@@ -408,6 +408,32 @@ def get_proxy():
     return None
 
 
+def _iso_proxy(tag="x"):
+    """Fresh Tor circuit per attempt via a unique SOCKS isolation key.
+
+    Tor's IsolateSOCKSAuth (SocksPort default) gives every unique SOCKS
+    username its own circuit, so each retry rides a brand-new exit in
+    ~1-2s — WITHOUT NEWNYM, which Tor rate-limits to ~1 per 10s and which
+    was the old 9-14s-per-attempt bottleneck (especially with concurrent
+    requests queueing on the rotation lock). Verified live 2026-10-17:
+    two different creds -> two different exit IPs.
+    """
+    key = f"fwd-{tag}-{secrets.token_hex(4)}"
+    url = f"socks5h://{key}:x@127.0.0.1:{SOCKS_PORT}"
+    return {"http": url, "https": url}
+
+
+def _exit_ip_via(proxy, timeout=4):
+    """Best-effort exit IP of `proxy`'s circuit (also warms the circuit)."""
+    try:
+        r = requests.get("https://api.ipify.org", proxies=proxy, timeout=timeout)
+        if r.status_code == 200:
+            return r.text.strip() or None
+    except Exception:
+        pass
+    return None
+
+
 def get_cookie_path():
     return os.path.join(BASE_DIR, "tor", "Data", "control_auth_cookie")
 
@@ -2016,11 +2042,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if attempt > 0 and (time.time() - _req_t0) > RETRY_WINDOW:
                 log.warning(f"retry window {RETRY_WINDOW:.0f}s exhausted for {self.path} model={current_model} at attempt {attempt+1}/{RETRY_ATTEMPTS}")
                 break
-            # Per-IP quotas: never spend an attempt on an exit that just
-            # burned us — hop to a fresh one first.
-            _escape_blacklisted_exit(f"{self.path} model={current_model}")
-            proxy = get_proxy()
-            log.info(f"Request: {method} {url} attempt={attempt+1}/{RETRY_ATTEMPTS} proxy={proxy} model={current_model}")
+            # Per-IP quotas, Tor-only: every attempt rides its OWN fresh exit
+            # (unique SOCKS isolation key -> new circuit in ~1-2s, no NEWNYM).
+            proxy = _iso_proxy(f"m{attempt}")
+            _attempt_exit = None
+            # Pay for an exit lookup / hop only once we know recent duds.
+            if _failed_exits:
+                for _esc in range(EXIT_BLACKLIST_MAX_ROTATIONS + 1):
+                    _attempt_exit = _exit_ip_via(proxy)
+                    if _attempt_exit and _is_failed_exit(_attempt_exit):
+                        log.warning(f"{self.path} model={current_model}: exit {_attempt_exit} is burned, hopping (escape {_esc + 1}/{EXIT_BLACKLIST_MAX_ROTATIONS})")
+                        proxy = _iso_proxy(f"m{attempt}e{_esc}")
+                        continue
+                    break
+            log.info(f"Request: {method} {url} attempt={attempt+1}/{RETRY_ATTEMPTS} proxy={proxy} exit={_attempt_exit or '?'} model={current_model}")
             try:
                 resp = self.attempt(method, url, body, headers, proxy)
 
@@ -2048,13 +2083,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if resp.status_code != 400:
                         # 400 = shape/model issue, not an IP burn: only
                         # 403/429/5xx mark an exit as burned.
-                        _record_failed_exit(_current_exit_ip())
+                        _record_failed_exit(_attempt_exit or _exit_ip_via(proxy))
 
                     if ROTATE_ON_429:
-                        rotated = renew_tor_ip()
-                        if rotated:
-                            continue
-                        log.warning("IP rotation failed, waiting before retry")
+                        # Next attempt = new isolation key = new circuit/exit.
+                        # No NEWNYM here (it was the 9-14s bottleneck).
+                        rotated = True
+                        continue
 
                     if attempt < RETRY_ATTEMPTS - 1:
                         time.sleep(wait)
@@ -2111,7 +2146,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                     pass
                                 log.warning(f"protocol fallback to chat for model={current_model} (ModelProtocolUnsupported)")
                                 _cresp = self.attempt(method, _curl, _cbody,
-                                                      headers, get_proxy())
+                                                      headers, proxy)
                                 log.info(f"Response: {_cresp.status_code} for {self.path} model={current_model} (chat fallback)")
                                 if _cresp.status_code == 200:
                                     if responses_client_stream:
@@ -2147,7 +2182,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                         pass
                                     log.warning(f"sealed-400 retry without include for model={current_model}")
                                     _sresp = self.attempt(method, url, _sbody,
-                                                          headers, get_proxy())
+                                                          headers, proxy)
                                     if _sresp.status_code == 200:
                                         log.info(f"Response: 200 for {self.path} model={current_model} (sealed retry)")
                                         _spsnip, _scached = "", None

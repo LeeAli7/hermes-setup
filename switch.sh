@@ -232,10 +232,10 @@ if [ -z "${MODEL:-}" ]; then
 fi
 
 case "$PROVIDER" in
-  # opencode-free, НЕ opencode-zen: keyless-провайдер Hermes (тот же Zen relay),
-  # иначе gate требует OPENCODE_ZEN_API_KEY для моделей вне keyless-allowlist
-  # (напр. muse-spark-1.3-contributor-free) и агент падает с AuthError.
-  opencode) PROVIDER_NAME="opencode-free"; BASE_URL="http://127.0.0.1:9000/zen/v1" ;;
+  # custom, НЕ opencode-zen: свой провайдер на локальный Zen relay (9000).
+  # opencode-zen требует OPENCODE_ZEN_API_KEY для моделей вне keyless-allowlist
+  # и агент падает с AuthError. 2026-10-17: вернули custom (рабочая конфигурация).
+  opencode) PROVIDER_NAME="custom"; BASE_URL="http://127.0.0.1:9000/zen/v1" ;;
   kilo)     PROVIDER_NAME="kilo";         BASE_URL="http://127.0.0.1:9001/api/openrouter" ;;
   kiro)     PROVIDER_NAME="kiro";         BASE_URL="http://127.0.0.1:8080/v1" ;;
   qwenmode) PROVIDER_NAME="qwenmode";     BASE_URL="http://127.0.0.1:5002/v1" ;;

@@ -101,11 +101,16 @@ don't overwrite blindly). The load-bearing keys:
 
 ```yaml
 model:
-  provider: opencode-free      # NOT opencode-zen (needs OPENCODE_ZEN_API_KEY -> AuthError)
-  default: muse-spark-1.3-contributor-free
+  provider: custom             # NOT opencode-zen (needs OPENCODE_ZEN_API_KEY -> AuthError);
+                               # `custom` = the local keyless Zen relay (was opencode-free)
+  default: glm-5.3-flash-free
   base_url: http://127.0.0.1:9000/zen/v1
-  supports_vision: true        # models.dev doesn't know opencode-free;
+  supports_vision: true        # models.dev doesn't know the local relay;
                                # without this, photos degrade to text stubs
+
+fallback_providers:            # 2026-10-17: when Tor exits are walled (403) the
+  - provider: kilo             # agent answers via kilo (127.0.0.1:9001) instead
+    model: kilo-auto/free      # of failing the whole turn
 ```
 
 Restart the gateway afterwards (`systemctl --user restart hermes-gateway.service`;
@@ -179,9 +184,10 @@ Two modes exist. Only one of them means the model actually sees:
 | Gateway log | `Image routing: native (model supports vision)` | `Image routing: text … Pre-analyzing … via vision_analyze` |
 
 Why `text` kicks in when it shouldn't: `models.dev` doesn't know our
-`opencode-free` alias (`unknown` → fallback). Fix = `model.supports_vision:
-true` in `~/.hermes/config.yaml` (already in the `config.yaml` template
-here) + gateway restart. Second trap (fixed): old `forwarder.py` dropped
+provider alias (`opencode-free`, now `custom`; `unknown` → fallback). Fix =
+`model.supports_vision: true` in `~/.hermes/config.yaml` (already in the
+`config.yaml` template here) + gateway restart. Second trap (fixed): old
+`forwarder.py` dropped
 `image_url` blocks when converting chat→responses — this repo's version
 maps them to `input_image` (user messages only; upstream 400s assistant
 images, and Hermes strips them on replay anyway).
