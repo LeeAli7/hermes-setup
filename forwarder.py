@@ -1,4 +1,4 @@
-import json, os, re, sys, logging, threading, time, socket, binascii, uuid, secrets, string, copy
+import json, os, re, sys, logging, threading, time, socket, select, binascii, uuid, secrets, string, copy
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import requests, urllib3
@@ -116,6 +116,12 @@ ROTATE_ON_429 = os.environ.get("FORWARDER_ROTATE_ON_429", "1") == "1"
 RETRY_WINDOW = float(os.environ.get("FORWARDER_RETRY_WINDOW", "360"))
 EXIT_BLACKLIST_TTL = float(os.environ.get("FORWARDER_EXIT_BLACKLIST_TTL", "1200"))
 EXIT_BLACKLIST_MAX_ROTATIONS = int(os.environ.get("FORWARDER_EXIT_BLACKLIST_MAX_ROTATIONS", "3"))
+# 2026-10-17 fail-fast: while NO 2xx has arrived for WALL_SUCCESS_LOOKBACK s,
+# every request is capped at WALL_FAST_ATTEMPTS fresh exits (~40-60s) and then
+# returns 503 so the agent's fallback (kilo) answers quickly. One success
+# restores the full sampling budget for partial walls.
+WALL_FAST_ATTEMPTS = int(os.environ.get("FORWARDER_WALL_FAST_ATTEMPTS", "12"))
+WALL_SUCCESS_LOOKBACK = float(os.environ.get("FORWARDER_WALL_SUCCESS_LOOKBACK", "300"))
 # Strict mode by default: never swap the requested model. To allow a rescue
 # model after repeated 429s, set FORWARDER_FALLBACK_MODELS="model1,model2".
 FALLBACK_MODELS = [m.strip() for m in os.environ.get(
@@ -432,6 +438,47 @@ def _exit_ip_via(proxy, timeout=4):
     except Exception:
         pass
     return None
+
+
+_outcome_lock = threading.Lock()
+_recent_outcomes = []  # list[(ts, ok)] — attempt outcomes across requests
+
+
+def _record_outcome(ok):
+    """Track attempt outcomes for the total-wall fast-fail detector."""
+    now = time.time()
+    with _outcome_lock:
+        _recent_outcomes.append((now, ok))
+        cutoff = now - WALL_SUCCESS_LOOKBACK
+        _recent_outcomes[:] = [o for o in _recent_outcomes if o[0] >= cutoff][-120:]
+
+
+def _wall_fast_mode():
+    """True while no 2xx was seen in the last WALL_SUCCESS_LOOKBACK seconds.
+
+    In this mode requests skip the ipify pre-checks (every exit burns anyway)
+    and give up after WALL_FAST_ATTEMPTS instead of the full budget.
+    """
+    now = time.time()
+    with _outcome_lock:
+        return not any(ok and (now - ts) < WALL_SUCCESS_LOOKBACK
+                       for ts, ok in _recent_outcomes)
+
+
+def _client_gone(conn):
+    """Best-effort check that the HTTP client abandoned the request."""
+    try:
+        r, _, _ = select.select([conn], [], [], 0)
+    except Exception:
+        return True
+    if not r:
+        return False
+    try:
+        return conn.recv(1, socket.MSG_PEEK) == b""
+    except BlockingIOError:
+        return False
+    except Exception:
+        return True
 
 
 def get_cookie_path():
@@ -2042,12 +2089,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if attempt > 0 and (time.time() - _req_t0) > RETRY_WINDOW:
                 log.warning(f"retry window {RETRY_WINDOW:.0f}s exhausted for {self.path} model={current_model} at attempt {attempt+1}/{RETRY_ATTEMPTS}")
                 break
+            if attempt > 0 and _client_gone(self.connection):
+                log.info(f"client gone, aborting retries for {self.path} model={current_model} after {attempt} attempts")
+                break
+            if attempt >= WALL_FAST_ATTEMPTS and _wall_fast_mode():
+                log.warning(f"no 2xx in last {WALL_SUCCESS_LOOKBACK:.0f}s — failing fast after {attempt} attempts for {self.path} model={current_model}")
+                break
             # Per-IP quotas, Tor-only: every attempt rides its OWN fresh exit
             # (unique SOCKS isolation key -> new circuit in ~1-2s, no NEWNYM).
             proxy = _iso_proxy(f"m{attempt}")
             _attempt_exit = None
-            # Pay for an exit lookup / hop only once we know recent duds.
-            if _failed_exits:
+            # Pay for an exit lookup / hop only once we know recent duds and
+            # the wall isn't total (in total-wall mode every exit burns).
+            if _failed_exits and not _wall_fast_mode():
                 for _esc in range(EXIT_BLACKLIST_MAX_ROTATIONS + 1):
                     _attempt_exit = _exit_ip_via(proxy)
                     if _attempt_exit and _is_failed_exit(_attempt_exit):
@@ -2083,7 +2137,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if resp.status_code != 400:
                         # 400 = shape/model issue, not an IP burn: only
                         # 403/429/5xx mark an exit as burned.
-                        _record_failed_exit(_attempt_exit or _exit_ip_via(proxy))
+                        _record_outcome(False)
+                        if _wall_fast_mode():
+                            # Total wall: every exit burns — skip the extra
+                            # ipify round-trip, the blacklist is saturated.
+                            if _attempt_exit:
+                                _record_failed_exit(_attempt_exit)
+                        else:
+                            _record_failed_exit(_attempt_exit or _exit_ip_via(proxy))
 
                     if ROTATE_ON_429:
                         # Next attempt = new isolation key = new circuit/exit.
@@ -2095,6 +2156,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         time.sleep(wait)
                 else:
                     log.info(f"Response: {resp.status_code} for {self.path} model={current_model}")
+                    if 200 <= resp.status_code < 300:
+                        _record_outcome(True)
                     # Universal protocol fallback (OpenAI-format path):
                     # chat-only model hit /responses -> re-issue the SAME
                     # turn as /chat/completions, answer in the shape the
