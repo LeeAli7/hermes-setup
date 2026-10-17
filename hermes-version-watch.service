@@ -1,0 +1,8 @@
+[Unit]
+Description=opencode CLI version watch (shape drift alert)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/hermes
+ExecStart=%h/projects/hermes/version_watch.sh

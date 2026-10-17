@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 logs/
 session_pins.json
+version_watch.state

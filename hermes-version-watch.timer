@@ -1,0 +1,11 @@
+[Unit]
+Description=Run opencode CLI version watch every 6 hours
+
+[Timer]
+OnCalendar=*-*-* 00/6:23:00
+Persistent=true
+RandomizedDelaySec=600
+Unit=hermes-version-watch.service
+
+[Install]
+WantedBy=timers.target
