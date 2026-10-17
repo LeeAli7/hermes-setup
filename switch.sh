@@ -8,7 +8,7 @@ STATE="$HOME/.config/hermes-switch.state"
 # Источник правды: free-models/*.txt (таймер hermes-refresh-models раз в 6 ч).
 # Fallback — встроенный список, если файлов нет/пустые.
 FREE_MODELS_DIR="$(dirname "$0")/free-models"
-FALLBACK_OPENCODE_MODELS="deepseek-v4-flash-free ling-3.0-flash-fin-free mimo-v2.5-free muse-spark-1.2-contributor-free muse-spark-1.3-contributor-free nemotron-3-ultra-free nemotron-3.5-lightning-free"
+FALLBACK_OPENCODE_MODELS="big-pickle beam-free mimo-v2.6-flash-free nemotron-3.5-super-vl-free nemotron-3.5-lightning-free step-5-preview-free longcat-2.5-preview-free deepseek-v4.1-flash-free glm-5.3-flash-free space-bunny-free"
 FALLBACK_KILO_MODELS="kilo-auto/free openrouter/free stepfun/step-3.7-flash:free poolside/laguna-s-2.1:free minimax/minimax-m3:free inclusionai/ling-3.0-flash-sante:free inclusionai/ling-3.0-flash-fin:free dots-studio/dots-3-note-preview:free liquid/lfm-2.5-2.6b:free nvidia/nemotron-3.5-lightning:free thinkingmachines/inkling-small:free thinkingmachines/inkling:free poolside/laguna-xs-2.1:free cohere/north-mini-code:free nvidia/nemotron-3.5-content-safety:free nvidia/nemotron-3-ultra-550b-a55b:free nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free nvidia/nemotron-3-super-120b-a12b:free minimax/minimax-m2.7:free"
 opencode_models="$(tr '\n' ' ' 2>/dev/null < "$FREE_MODELS_DIR/opencode.txt" | tr -s ' ' | sed 's/^ //;s/ $//')" || true
 if [ -z "$opencode_models" ]; then opencode_models="$FALLBACK_OPENCODE_MODELS"; fi

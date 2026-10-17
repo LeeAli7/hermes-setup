@@ -44,6 +44,10 @@ release_kilo() {
 filter_free() {
   python3 -c '
 import json, sys
+# Мёртвые/неподдерживаемые модели: upstream-каталог их перечисляет, но
+# инференс отдаёт 400 ModelProtocolUnsupported на обоих протоколах
+# (jev проверен 2026-10-17). Не пускаем их в списки switch.sh.
+DEAD_MODELS = {"jev-1.13-free"}
 try:
     d = json.load(sys.stdin)
 except Exception as e:
@@ -58,7 +62,7 @@ else:
 n = 0
 for m in items:
     i = m.get("id", "") if isinstance(m, dict) else str(m)
-    if "free" in i.lower():
+    if "free" in i.lower() and i not in DEAD_MODELS:
         print(i)
         n += 1
 if n == 0:
@@ -71,7 +75,16 @@ fetch_one() {
   name="$1"; url="$2"; dest="$3"
   tmp="$dest.tmp.$$"
   log "fetch $name <- $url"
-  if curl -sf --max-time "$TIMEOUT" "$url" 2>"$tmp.curlerr" | filter_free > "$tmp" 2>"$tmp.filtererr"; then
+  if curl -sf --max-time "$TIMEOUT" "$url" 2>"$tmp.curlerr" | python3 -c '
+# 2026-10-17: gzip -dc || cat ate the first ~256KB of a NON-gzip body before
+# failing, so identity JSON arrived truncated mid-stream. Decode only when
+# the body actually is gzip; otherwise pass the bytes through untouched.
+import sys, gzip
+b = sys.stdin.buffer.read()
+if b[:2] == b"\x1f\x8b":
+    b = gzip.decompress(b)
+sys.stdout.buffer.write(b)
+' | filter_free > "$tmp" 2>"$tmp.filtererr"; then
     mv -f "$tmp" "$dest"
     rm -f "$tmp.curlerr" "$tmp.filtererr"
     log "OK $name: $(wc -l < "$dest") моделей -> $dest"

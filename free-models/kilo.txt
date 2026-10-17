@@ -1,5 +1,7 @@
 kilo-auto/free
-stepfun/step-5-preview-free
+nvidia/nemotron-3.5-super-vl:free
+reflection/beam-free
+xingchen-agi/xing4.0-29b-a4b:free
 dots-studio/dots-3-note-preview:free
 liquid/lfm-2.5-2.6b:free
 nvidia/nemotron-3.5-lightning:free

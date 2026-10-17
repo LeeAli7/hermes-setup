@@ -35,7 +35,10 @@ def _forge_attempt(method, url, body, headers, proxy=None,
         ("Connection", "keep-alive"),
         ("Accept", "*/*"),
         ("Host", "opencode.ai"),
-        ("Accept-Encoding", get("accept-encoding", "gzip, deflate, br, zstd")),
+        # 2026-10-17: pinned back to gzip/deflate. With "br, zstd" upstream
+        # answered brotli and passthrough() drops content-encoding, so local
+        # consumers (refresh-free-models.sh) got raw brotli -> JSON parse fail.
+        ("Accept-Encoding", "gzip, deflate"),
     ]
     ordered = [(k, v) for k, v in ordered if v != ""]
     socks = None
@@ -69,20 +72,28 @@ log = logging.getLogger("forwarder")
 UPSTREAM_BASE = os.environ.get("UPSTREAM_BASE", "https://opencode.ai")
 
 
-def _zen_to_inference(path):
-    """Rewrite legacy /zen/* outbound paths to the new /inference/* family.
+def _zen_to_inference(path, is_responses_model=False):
+    """Rewrite legacy /zen/* outbound paths to the new /inference/openai/v1/* family.
 
-    2026-10-15 (verified live): opencode.ai moved the free tier to
-    /inference/v1/*. The legacy /zen/v1/* family now returns
-    403 FreeTierError ("can only be used from within OpenCode") for EVERY
-    caller — Tor exit IP, UA, bearer, toolset all irrelevant; the path alone
-    is the gate. /zen/v1/models (the catalog) still works, so only the
-    chat/completions + responses families move.
+    2026-10-17 (verified live): opencode.ai moved the free tier again:
+    /inference/v1/* is now retired (410 Gone). The live path is
+    /inference/openai/v1/*. /zen/v1/models (the catalog) still works,
+    so only the chat/completions + responses families move.
+
+    Responses-capable models go to /inference/openai/v1/responses;
+    chat-only models go to /inference/openai/v1/chat/completions.
     """
     if path.startswith("/zen/v1/models"):
         return path
     if path.startswith("/zen/"):
-        return "/inference/" + path[len("/zen/"):]
+        rest = path[len("/zen/"):]  # e.g. "v1/responses", "v1/chat/completions"
+        if is_responses_model and rest.startswith(("v1/responses", "v1/chat/completions")):
+            # Responses models: route /zen/v1/responses -> /inference/openai/v1/responses
+            return "/inference/openai/" + rest
+        if not is_responses_model and rest.startswith("v1/responses"):
+            # Chat-only models: route /zen/v1/responses -> /inference/openai/v1/chat/completions
+            return "/inference/openai/v1/chat/completions"
+        return "/inference/openai/" + rest
     return path
 CONTROL_PORT = 9051
 SOCKS_PORT = 9050
@@ -95,10 +106,16 @@ MAX_BODY_SIZE = int(os.environ.get("FORWARDER_MAX_BODY", str(20 * 1024 * 1024)))
 # opencode CLI survives by retrying with backoff (isRetryable=true).
 # So on 429 we: retry with backoff -> rotate Tor once -> retry, and if the
 # model keeps failing, fall back to a known-alive model (env-configurable).
-RETRY_ATTEMPTS = int(os.environ.get("FORWARDER_429_ATTEMPTS", "10"))
+RETRY_ATTEMPTS = int(os.environ.get("FORWARDER_429_ATTEMPTS", "30"))
 RETRY_BACKOFF = float(os.environ.get("FORWARDER_429_BACKOFF", "8"))
 MAX_BACKOFF = float(os.environ.get("FORWARDER_429_MAX_BACKOFF", "40"))
 ROTATE_ON_429 = os.environ.get("FORWARDER_ROTATE_ON_429", "1") == "1"
+# 2026-10-17 (per-IP quotas, Tor-only): each retry must ride a FRESH exit.
+# 30 attempts x ~6-8s of rotation ~= 3-4 min sampling window — enough to
+# outlast the upstream "walls"; the window guard caps worst-case latency.
+RETRY_WINDOW = float(os.environ.get("FORWARDER_RETRY_WINDOW", "360"))
+EXIT_BLACKLIST_TTL = float(os.environ.get("FORWARDER_EXIT_BLACKLIST_TTL", "1200"))
+EXIT_BLACKLIST_MAX_ROTATIONS = int(os.environ.get("FORWARDER_EXIT_BLACKLIST_MAX_ROTATIONS", "3"))
 # Strict mode by default: never swap the requested model. To allow a rescue
 # model after repeated 429s, set FORWARDER_FALLBACK_MODELS="model1,model2".
 FALLBACK_MODELS = [m.strip() for m in os.environ.get(
@@ -448,8 +465,10 @@ def renew_tor_ip():
                         except:
                             old_ip = None
                         new_ip = None
-                        for _ in range(5):
-                            time.sleep(5)
+                        # Fresh circuits usually come online in 1-3s after
+                        # NEWNYM; check early and often (7 x 2s ≈ 14s worst).
+                        for _ in range(7):
+                            time.sleep(2)
                             new_ip = get_tor_ip()
                             if new_ip and new_ip != old_ip:
                                 break
@@ -566,6 +585,55 @@ def rotate_or_wait(context):
         time.sleep(wait)
         return False
     return bool(renew_tor_ip())
+
+
+# --- burned-exit blacklist (2026-10-17) ---
+# Free-tier quotas are enforced per IP and Tor exits are shared, so an exit
+# that just answered 403/429 is likely burned for a while. Remember burned
+# exits and rotate past them WITHOUT spending an upstream attempt on a
+# known-dud IP. Pure in-memory (cleared on restart), TTL-bounded.
+_failed_exits = {}  # exit ip -> last failure ts
+_failed_exits_lock = threading.Lock()
+
+
+def _current_exit_ip():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f).get("tor_exit_ip")
+    except Exception:
+        return None
+
+
+def _record_failed_exit(ip):
+    if not ip:
+        return
+    now = time.time()
+    with _failed_exits_lock:
+        _failed_exits[ip] = now
+        cutoff = now - EXIT_BLACKLIST_TTL
+        for k in [k for k, v in _failed_exits.items() if v < cutoff]:
+            _failed_exits.pop(k, None)
+
+
+def _is_failed_exit(ip):
+    if not ip:
+        return False
+    with _failed_exits_lock:
+        ts = _failed_exits.get(ip)
+    return ts is not None and (time.time() - ts) < EXIT_BLACKLIST_TTL
+
+
+def _escape_blacklisted_exit(context):
+    """Hop off a burned exit BEFORE spending an attempt on it."""
+    if _boot_grace_left() > 0:
+        return
+    for i in range(EXIT_BLACKLIST_MAX_ROTATIONS):
+        ip = _current_exit_ip()
+        if not _is_failed_exit(ip):
+            return
+        log.warning(f"{context}: exit {ip} is burned, pre-rotating ({i + 1}/{EXIT_BLACKLIST_MAX_ROTATIONS})")
+        if not renew_tor_ip():
+            return
 
 
 def get_tor_ip():
@@ -1788,7 +1856,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Tor exit, any UA, any bearer). The path alone is the gate.
         # Inbound clients keep asking for /zen/* (public contract), so we
         # rewrite the outbound path one-for-one.
-        upstream_path = _zen_to_inference(self.path)
+
+        # Extract model early for path routing (responses vs chat-only models)
+        RESPONSES_MODELS = {"muse-spark-1.3-contributor-free", "muse-spark-1.2-contributor-free", "jev-1.13-free"}
+        current_model = None
+        if body:
+            try:
+                current_model = json.loads(body).get("model")
+            except Exception:
+                current_model = None
+        _is_responses_model = current_model in RESPONSES_MODELS
+
+        upstream_path = _zen_to_inference(self.path, is_responses_model=_is_responses_model)
         url = UPSTREAM_BASE + upstream_path
         headers = {k: v for k, v in self.headers.items() if k.lower() not in FORBIDDEN_HEADERS}
         headers["User-Agent"] = UPSTREAM_UA
@@ -1803,23 +1882,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         _sess = _sticky_session_for(body)
         headers["x-opencode-session"] = _sess
 
-        current_model = None
-        if body:
-            try:
-                current_model = json.loads(body).get("model")
-            except Exception:
-                current_model = None
-        try:
-            log.info(f"opencode-session={_sess} model={current_model}")
-        except Exception:
-            pass
-
-        RESPONSES_MODELS = {"muse-spark-1.3-contributor-free", "muse-spark-1.2-contributor-free"}
         use_responses_api = (
             current_model in RESPONSES_MODELS
-            and "/chat/completions" in self.path
+            and ("/responses" in self.path or "/chat/completions" in self.path)
         )
-        if use_responses_api:
+        # Convert chat->responses ONLY when the client actually sent chat
+        # shape. A native /responses body must never be clobbered.
+        _client_body_is_chat = False
+        try:
+            _cbj = json.loads(body) if body else {}
+            _client_body_is_chat = isinstance(_cbj.get("messages"), list)
+        except Exception:
+            _client_body_is_chat = False
+        if use_responses_api and _client_body_is_chat:
             try:
                 chat = json.loads(body)
                 responses_body = {
@@ -1847,7 +1922,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if r_tc:
                     responses_body["tool_choice"] = r_tc
                 body = json.dumps(responses_body).encode()
-                url = UPSTREAM_BASE + _zen_to_inference("/zen/v1/responses")
+                # is_responses_model=True is REQUIRED: the default (chat-only)
+                # rewrite maps v1/responses -> v1/chat/completions, which sent
+                # a responses body to the chat endpoint (400/410 observed).
+                url = UPSTREAM_BASE + _zen_to_inference("/zen/v1/responses", is_responses_model=True)
                 log.info(f"Converted chat/completions -> responses API for model={current_model}")
             except Exception as e:
                 log.warning(f"Failed to convert to responses API: {e}")
@@ -1856,8 +1934,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Pad converted AND native /responses bodies to full CLI shape.
         # Remember the client's own stream wish BEFORE padding forces
         # stream:true upstream (downstream routing depends on it).
+        # Only pad responses-shaped bodies for responses-capable models.
         responses_client_stream = False
-        if body and (url.endswith("/responses") or "/responses" in self.path):
+        if body and use_responses_api:
             try:
                 responses_client_stream = bool(json.loads(body).get("stream"))
             except Exception:
@@ -1895,7 +1974,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Chat path (/chat/completions, non-converted models): same gate
         # wants CLI-known tools (verified 18.09.2026). Minimal valid defs.
         chat_client_stream = False
-        if body and "/chat/completions" in self.path and "responses" not in url:
+        if body and "/chat/completions" in url:
             try:
                 cj = json.loads(body)
                 if isinstance(cj, dict) and isinstance(cj.get("messages"), list):
@@ -1932,20 +2011,44 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 pass
 
         rotated = False
+        _req_t0 = time.time()
         for attempt in range(RETRY_ATTEMPTS):
+            if attempt > 0 and (time.time() - _req_t0) > RETRY_WINDOW:
+                log.warning(f"retry window {RETRY_WINDOW:.0f}s exhausted for {self.path} model={current_model} at attempt {attempt+1}/{RETRY_ATTEMPTS}")
+                break
+            # Per-IP quotas: never spend an attempt on an exit that just
+            # burned us — hop to a fresh one first.
+            _escape_blacklisted_exit(f"{self.path} model={current_model}")
             proxy = get_proxy()
             log.info(f"Request: {method} {url} attempt={attempt+1}/{RETRY_ATTEMPTS} proxy={proxy} model={current_model}")
             try:
                 resp = self.attempt(method, url, body, headers, proxy)
 
-                if resp.status_code == 429 or resp.status_code >= 500:
+                _retryable = (resp.status_code == 429
+                              or resp.status_code >= 500
+                              or resp.status_code in (400, 403))
+                if _retryable:
                     if resp.status_code == 429:
                         wait = retry_after_seconds(resp, min(RETRY_BACKOFF * (attempt + 1), MAX_BACKOFF))
                         log.warning(f"429 for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
+                    elif resp.status_code == 400:
+                        # Always log the upstream 400 body (redacted) for diagnosis
+                        _psnip, _cached = _read_error_snippet(resp)
+                        if _psnip:
+                            log.warning(f"upstream 400 body for {self.path} model={current_model}: {_redact_error_snippet(_psnip)}")
+                        wait = min(RETRY_BACKOFF * (attempt + 1), MAX_BACKOFF)
+                        log.warning(f"400 for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
+                    elif resp.status_code == 403:
+                        wait = min(RETRY_BACKOFF * (attempt + 1), MAX_BACKOFF)
+                        log.warning(f"403 for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
                     else:
                         wait = min(RETRY_BACKOFF * (attempt + 1), MAX_BACKOFF)
                         log.warning(f"{resp.status_code} for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
                     resp.close()
+                    if resp.status_code != 400:
+                        # 400 = shape/model issue, not an IP burn: only
+                        # 403/429/5xx mark an exit as burned.
+                        _record_failed_exit(_current_exit_ip())
 
                     if ROTATE_ON_429:
                         rotated = renew_tor_ip()
@@ -2379,7 +2482,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             log.info(f"anthropic: beta mode off (?beta=false) for model={up_model}, stripped beta headers")
 
         _RESPONSES_MODELS = {"muse-spark-1.3-contributor-free",
-                             "muse-spark-1.2-contributor-free"}
+                             "muse-spark-1.2-contributor-free",
+                             "jev-1.13-free"}
         pinned = get_pinned_protocol(up_model)
         if pinned == "chat":
             use_responses_api = False
@@ -2482,7 +2586,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
                 body = json.dumps(responses_body).encode()
-                url = UPSTREAM_BASE + _zen_to_inference("/zen/v1/responses")
+                url = UPSTREAM_BASE + _zen_to_inference("/zen/v1/responses", is_responses_model=True)
                 log.info(f"anthropic: converted to responses API for model={up_model}")
             except Exception as e:
                 log.warning(f"anthropic: failed to convert to responses API: {e}")
