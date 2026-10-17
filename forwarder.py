@@ -28,11 +28,14 @@ def _forge_attempt(method, url, body, headers, proxy=None,
         ("Authorization", get("authorization", "")),
         ("Content-Type", get("content-type", "application/json")),
         ("User-Agent", get("user-agent", UPSTREAM_UA)),
+        ("b3", get("b3", "")),
+        ("traceparent", get("traceparent", "")),
         ("x-opencode-client", get("x-opencode-client", "cli")),
-        ("x-opencode-project", get("x-opencode-project", "global")),
-        ("x-opencode-request", get("x-opencode-request", "")),
+        ("x-opencode-project", get("x-opencode-project", UPSTREAM_PROJECT)),
         ("x-opencode-session", get("x-opencode-session", "")),
         ("x-opencode-session-id", get("x-opencode-session-id", "")),
+        ("x-session-affinity", get("x-session-affinity", "")),
+        ("x-session-id", get("x-session-id", "")),
         ("Connection", "keep-alive"),
         ("Accept", "*/*"),
         ("Host", "opencode.ai"),
@@ -148,13 +151,49 @@ FALLBACK_MODELS = [m.strip() for m in os.environ.get(
 # The ses_/msg_ IDs are FORMAT-validated server-side (reverse-engineered from
 # the CLI binary + its local opencode.db). Random UUIDs -> 403. Missing
 # headers -> 403. Wrong bearer (e.g. Hermes' placeholder) -> 401.
-# 2026-10-17: re-captured CLI 1.19.3 (MITM, byte-identical replay): UA bumped
-# 1.18.32 -> 1.19.3 and x-opencode-session-id added — the missing header is
-# the likely cause of the sudden all-403 "wall" once opencode shipped 1.19.x.
+# 2026-10-17 (pm): re-captured CLI 1.19.3 (MITM, byte-identical replay): UA
+# bumped 1.18.32 -> 1.19.3 and x-opencode-session-id added — the missing
+# header was the likely cause of the sudden all-403 "wall" once opencode
+# shipped 1.19.x.
+# 2026-10-17 (night): opencode moved to the v2 channel (npm @opencode/cli;
+# opencode.ai/update/api/latest/cli/npm reports 2.0.32). Re-captured CLI
+# 2.0.32 (MITM): UA is now "opencode/latest/<ver>/cli"; x-opencode-request
+# is gone; x-opencode-project is a stable 32-hex project id (was "global");
+# added x-session-affinity + x-session-id (same ses value) and OTel
+# b3/traceparent. Forwarder now emulates the 2.0.32 shape.
 UPSTREAM_UA = os.environ.get(
     "FORWARDER_UA",
-    "opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+    "opencode/latest/2.0.32/cli",
 )
+# Stable 32-hex project id (real CLI hashes its project dir; the value is
+# opaque server-side — only the shape matters). Overridable for tests.
+UPSTREAM_PROJECT = os.environ.get(
+    "FORWARDER_PROJECT",
+    "0b531ab0783dce02469f088b3043ddf2",
+)
+# One trace-id per process; fresh span per request (mirrors CLI 2.x).
+_TRACE_ID = secrets.token_hex(16)
+
+
+def _trace_headers():
+    """Fresh b3 + W3C traceparent context (CLI 2.0.32 sends both)."""
+    span = secrets.token_hex(8)
+    return {
+        "b3": "%s-%s-1-%s" % (_TRACE_ID, span, secrets.token_hex(8)),
+        "traceparent": "00-%s-%s-01" % (_TRACE_ID, span),
+    }
+
+
+def _cli_session_headers(sess):
+    """Session + trace headers exactly as CLI 2.0.32 emits them."""
+    h = {
+        "x-opencode-session": sess,
+        "x-opencode-session-id": sess,
+        "x-session-affinity": sess,
+        "x-session-id": sess,
+    }
+    h.update(_trace_headers())
+    return h
 # Literal public bearer the official CLI sends. ALWAYS overwritten outbound:
 # Hermes sends its own placeholder (opencode-zen-free-keyless) which 401s.
 # 2026-10-15: default BACK to "Bearer public" — the new /inference/* family
@@ -1976,14 +2015,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Real CLI sends no Authorization on keyless calls; Hermes'
         # placeholder bearer (401s) and no/UUID session headers (403s)
         # must never leak upstream. Exact CLI shape, verified 17.09.2026,
-        # auth updated 14.10.2026 (literal "Bearer public" now 403s).
+        # auth updated 14.10.2026 (literal "Bearer public" now 403s);
+        # shape upgraded to CLI 2.0.32 on 17.10.2026 (see UPSTREAM_UA).
         _apply_upstream_auth(headers)
         headers["x-opencode-client"] = "cli"
-        headers["x-opencode-project"] = "global"
-        headers["x-opencode-request"] = _new_request_id()
+        headers["x-opencode-project"] = UPSTREAM_PROJECT
         _sess = _sticky_session_for(body)
-        headers["x-opencode-session"] = _sess
-        headers["x-opencode-session-id"] = _sess
+        headers.update(_cli_session_headers(_sess))
 
         use_responses_api = (
             current_model in RESPONSES_MODELS
@@ -2252,7 +2290,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                 _cbody = json.dumps(_chat).encode()
                                 _curl = UPSTREAM_BASE + _zen_to_inference("/zen/v1/chat/completions")
                                 try:
-                                    headers["x-opencode-request"] = _new_request_id()
+                                    headers.update(_trace_headers())
                                 except Exception:
                                     pass
                                 log.warning(f"protocol fallback to chat for model={current_model} (ModelProtocolUnsupported)")
@@ -2288,7 +2326,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                         _sobj.pop("include", None)
                                     _sbody = json.dumps(_sobj).encode()
                                     try:
-                                        headers["x-opencode-request"] = _new_request_id()
+                                        headers.update(_trace_headers())
                                     except Exception:
                                         pass
                                     log.warning(f"sealed-400 retry without include for model={current_model}")
@@ -2420,9 +2458,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def handle_filtered_openai_models(self):
         """Remote GET /zen/v1/models: upstream payload trimmed to free-only."""
         headers = {"User-Agent": UPSTREAM_UA,
-                   "x-opencode-client": "cli", "x-opencode-project": "global",
-                   "x-opencode-request": _new_request_id(),
-                   "x-opencode-session": _new_session_id()}
+                   "x-opencode-client": "cli", "x-opencode-project": UPSTREAM_PROJECT}
+        headers.update(_cli_session_headers(_new_session_id()))
         _apply_upstream_auth(headers)
         data = None
         try:
@@ -2530,9 +2567,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                       "Method not allowed, use GET /v1/models")
             return
         headers = {"User-Agent": UPSTREAM_UA,
-                   "x-opencode-client": "cli", "x-opencode-project": "global",
-                   "x-opencode-request": _new_request_id(),
-                   "x-opencode-session": _new_session_id()}
+                   "x-opencode-client": "cli", "x-opencode-project": UPSTREAM_PROJECT}
+        headers.update(_cli_session_headers(_new_session_id()))
         _apply_upstream_auth(headers)
         data = None
         try:
@@ -2613,10 +2649,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         headers["User-Agent"] = UPSTREAM_UA
         _apply_upstream_auth(headers)
         headers["x-opencode-client"] = "cli"
-        headers["x-opencode-project"] = "global"
-        headers["x-opencode-request"] = _new_request_id()
-        headers["x-opencode-session"] = sess
-        headers["x-opencode-session-id"] = sess
+        headers["x-opencode-project"] = UPSTREAM_PROJECT
+        headers.update(_cli_session_headers(sess))
         # beta handling is default-ON: plain /v1/messages behaves like
         # ?beta=true (kept for compat); ?beta=false/0 opts out and strips
         # Anthropic beta-negotiation headers before upstream.
@@ -2681,7 +2715,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             try:
                 body = _build_chat_body()
                 try:
-                    headers["x-opencode-request"] = _new_request_id()
+                    headers.update(_trace_headers())
                 except Exception:
                     pass
                 log.warning(f"anthropic: protocol fallback to chat for model={up_model} ({reason})")
@@ -2923,7 +2957,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             rotated = renew_tor_ip()
                             if rotated:
                                 try:
-                                    headers["x-opencode-request"] = _new_request_id()
+                                    headers.update(_trace_headers())
                                 except Exception:
                                     pass
                                 continue
@@ -2948,7 +2982,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         try:
                             body = _rebuild_anthropic_body(**kwargs)
                             try:
-                                headers["x-opencode-request"] = _new_request_id()
+                                headers.update(_trace_headers())
                             except Exception:
                                 pass
                         except Exception as e:
