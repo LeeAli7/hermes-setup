@@ -1,6 +1,7 @@
 #!/bin/sh
 # Обновление списков free-моделей для switch.sh.
-# Источники: форвардеры через Tor (могут отвечать 30-60 c).
+# Использование: refresh-free-models.sh [opencode|kilo]   (без аргумента — оба)
+# Источники: локальные форвардеры (opencode 9000, kilo 9001 — через Tor).
 # При ошибке сети старый файл НЕ трогается, выход ненулевой.
 set -u
 
@@ -12,6 +13,17 @@ FAIL=0
 
 mkdir -p "$DIR"
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >&2; }
+
+# Фильтр по провайдеру (18.10.2026): switch.sh обновляет только нужный
+# список — не дёргает kilo, если нужен только opencode, и наоборот.
+WANT_OPENCODE=1
+WANT_KILO=1
+case "${1:-all}" in
+  all) ;;
+  opencode) WANT_KILO=0 ;;
+  kilo)     WANT_OPENCODE=0 ;;
+  *) log "неизвестный аргумент '$1' (use: opencode|kilo|пусто)"; exit 2 ;;
+esac
 
 port_open() { ss -tln 2>/dev/null | grep -q ":$1 "; }
 
@@ -97,13 +109,21 @@ sys.stdout.buffer.write(b)
   fi
 }
 
-fetch_one opencode "$OPENCODE_URL" "$DIR/opencode.txt"
-if ensure_kilo; then
-  fetch_one kilo "$KILO_URL" "$DIR/kilo.txt"
-  release_kilo
+if [ "$WANT_OPENCODE" = "1" ]; then
+  fetch_one opencode "$OPENCODE_URL" "$DIR/opencode.txt"
 else
-  FAIL=1
+  log "opencode: пропускаю (не запрошен)"
+fi
+if [ "$WANT_KILO" = "1" ]; then
+  if ensure_kilo; then
+    fetch_one kilo "$KILO_URL" "$DIR/kilo.txt"
+    release_kilo
+  else
+    FAIL=1
+  fi
+else
+  log "kilo: пропускаю (не запрошен)"
 fi
 
-[ "$FAIL" -eq 0 ] && log "done: оба списка обновлены" || log "done: есть ошибки, exit $FAIL"
+if [ "$FAIL" -eq 0 ]; then log "done: списки обновлены"; else log "done: есть ошибки, exit $FAIL"; fi
 exit "$FAIL"

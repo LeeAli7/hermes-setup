@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-HERMES="/home/ubuntu/.hermes/hermes-agent/venv/bin/hermes"
+HERMES="$HOME/.hermes/hermes-agent/venv/bin/hermes"
 STATE="$HOME/.config/hermes-switch.state"
 
 # --- Live free models (auto-refresh, см. refresh-free-models.sh) ---
@@ -10,10 +10,85 @@ STATE="$HOME/.config/hermes-switch.state"
 FREE_MODELS_DIR="$(dirname "$0")/free-models"
 FALLBACK_OPENCODE_MODELS="big-pickle beam-free mimo-v2.6-flash-free nemotron-3.5-super-vl-free nemotron-3.5-lightning-free step-5-preview-free longcat-2.5-preview-free deepseek-v4.1-flash-free glm-5.3-flash-free space-bunny-free"
 FALLBACK_KILO_MODELS="kilo-auto/free openrouter/free stepfun/step-3.7-flash:free poolside/laguna-s-2.1:free minimax/minimax-m3:free inclusionai/ling-3.0-flash-sante:free inclusionai/ling-3.0-flash-fin:free dots-studio/dots-3-note-preview:free liquid/lfm-2.5-2.6b:free nvidia/nemotron-3.5-lightning:free thinkingmachines/inkling-small:free thinkingmachines/inkling:free poolside/laguna-xs-2.1:free cohere/north-mini-code:free nvidia/nemotron-3.5-content-safety:free nvidia/nemotron-3-ultra-550b-a55b:free nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free nvidia/nemotron-3-super-120b-a12b:free minimax/minimax-m2.7:free"
-opencode_models="$(tr '\n' ' ' 2>/dev/null < "$FREE_MODELS_DIR/opencode.txt" | tr -s ' ' | sed 's/^ //;s/ $//')" || true
-if [ -z "$opencode_models" ]; then opencode_models="$FALLBACK_OPENCODE_MODELS"; fi
-kilo_models="$(tr '\n' ' ' 2>/dev/null < "$FREE_MODELS_DIR/kilo.txt" | tr -s ' ' | sed 's/^ //;s/ $//')" || true
-if [ -z "$kilo_models" ]; then kilo_models="$FALLBACK_KILO_MODELS"; fi
+REFRESH_SCRIPT="$(dirname "$0")/refresh-free-models.sh"
+MODELS_TTL="${HERMES_MODELS_TTL:-1800}"                  # сек; по умолчанию 30 мин
+REFRESH_TIMEOUT="${HERMES_MODELS_REFRESH_TIMEOUT:-240}"  # сек; потолок обновления
+
+# --refresh / -r — форсировать обновление списков (перед меню/--list).
+FORCE_REFRESH=0
+if [ "${1:-}" = "--refresh" ] || [ "${1:-}" = "-r" ]; then
+  FORCE_REFRESH=1
+  shift
+fi
+
+load_model_lists() {
+  opencode_models="$(tr '\n' ' ' 2>/dev/null < "$FREE_MODELS_DIR/opencode.txt" | tr -s ' ' | sed 's/^ //;s/ $//')" || true
+  if [ -z "$opencode_models" ]; then opencode_models="$FALLBACK_OPENCODE_MODELS"; fi
+  kilo_models="$(tr '\n' ' ' 2>/dev/null < "$FREE_MODELS_DIR/kilo.txt" | tr -s ' ' | sed 's/^ //;s/ $//')" || true
+  if [ -z "$kilo_models" ]; then kilo_models="$FALLBACK_KILO_MODELS"; fi
+}
+
+models_stale_for() {  # $1 = opencode|kilo; true если файл старше TTL/отсутствует
+  f="$FREE_MODELS_DIR/$1.txt"
+  [ -f "$f" ] || return 0
+  m="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  if [ $((now - m)) -ge "$MODELS_TTL" ]; then
+    return 0
+  fi
+  return 1
+}
+
+port_up() { ss -tln 2>/dev/null | grep -q ":$1 "; }
+
+refresh_models_if_stale() {  # $1 = opencode|kilo
+  prov="$1"
+  if [ "$FORCE_REFRESH" != "1" ]; then
+    if ! models_stale_for "$prov"; then
+      return 0
+    fi
+  fi
+  if [ ! -x "$REFRESH_SCRIPT" ]; then
+    echo "!!! $REFRESH_SCRIPT не найден или не исполняемый — списки не обновляю." >&2
+    return 0
+  fi
+  if [ "$FORCE_REFRESH" = "1" ]; then
+    echo "--- --refresh: обновляю список $prov ..." >&2
+  else
+    echo "--- Список $prov старше $((MODELS_TTL / 60)) мин — обновляю ..." >&2
+  fi
+  # Каталогу opencode нужен живой forwarder: будим, если спал.
+  if [ "$prov" = "opencode" ] && ! port_up 9000; then
+    echo "--- Бужу hermes-opencode-forwarder на время обновления ..." >&2
+    systemctl --user start hermes-opencode-forwarder.service >/dev/null 2>&1 || true
+    i=0
+    while [ $i -lt 20 ]; do
+      if port_up 9000; then break; fi
+      sleep 2
+      i=$((i+1))
+    done
+  fi
+  if [ "$FORCE_REFRESH" = "1" ]; then
+    # явный запрос — показываем лог refresh-скрипта
+    rc=0
+    timeout "$REFRESH_TIMEOUT" "$REFRESH_SCRIPT" "$prov" || rc=$?
+    if [ "$rc" = "0" ]; then
+      echo "--- Список $prov обновлён." >&2
+    else
+      echo "!!! Обновление $prov не удалось (rc=$rc) — беру текущий список." >&2
+    fi
+  else
+    if timeout "$REFRESH_TIMEOUT" "$REFRESH_SCRIPT" "$prov" >/dev/null 2>&1; then
+      echo "--- Список $prov обновлён." >&2
+    else
+      echo "--- Не удалось обновить (сеть/таймаут) — беру текущий список." >&2
+    fi
+  fi
+  load_model_lists
+  return 0
+}
+
+load_model_lists
 kiro_models="claude-sonnet-4 claude-sonnet-4.5 claude-haiku-4.5 qwen3-coder-next deepseek-3.2 minimax-m2.5 minimax-m2.1 glm-5"
 qwenmode_models="Qwen3.8-Max"
 chatgpt_models="gpt-5-6"
@@ -60,6 +135,7 @@ Usage:
   switch.sh [provider] [model]
   switch.sh --help | -h
   switch.sh --list | -l [provider]
+  switch.sh --refresh [provider] [model]
 
 Providers:
   opencode  — opencode.ai через Tor (http://127.0.0.1:9000/zen/v1)
@@ -72,12 +148,17 @@ Providers:
 (экономия RAM). Выбор запоминается и восстанавливается после ребута
 (provider-restore.service).
 
+Списки free-моделей обновляются автоматически, если файл старше
+HERMES_MODELS_TTL секунд (по умолчанию 1800 = 30 мин). Флаг --refresh
+форсирует обновление перед показом меню/списка.
+
 Examples:
   switch.sh chatgpt gpt-5-6
-  switch.sh opencode mimo-v2.5-free
+  switch.sh opencode mimo-v2.6-flash-free
   switch.sh opencode              # интерактивное меню модели
   switch.sh                       # меню провайдера + модели
   switch.sh --list opencode
+  switch.sh --refresh --list opencode
 USAGE
 }
 
@@ -120,9 +201,15 @@ fi
 
 if [ "${1:-}" = "-l" ] || [ "${1:-}" = "--list" ] || [ "${1:-}" = "list" ]; then
   if [ $# -eq 2 ]; then
+    case "$2" in
+      opencode|kilo) refresh_models_if_stale "$2" ;;
+    esac
     list_models "$2"
     exit 0
   fi
+  # без провайдера: показываем все — обновим оба списка, если устарели
+  refresh_models_if_stale opencode
+  refresh_models_if_stale kilo
   for p in opencode kilo kiro qwenmode chatgpt; do
     echo "--- $p ---" >&2
     list_models "$p" >&2
@@ -181,6 +268,9 @@ if [ $# -ge 2 ]; then
     opencode|kilo|kiro|qwenmode|chatgpt) ;;
     *) echo "Unknown provider: $PROVIDER (use: $VALID_PROV)" >&2; usage; exit 1 ;;
   esac
+  if [ "$FORCE_REFRESH" = "1" ]; then
+    case "$PROVIDER" in opencode|kilo) refresh_models_if_stale "$PROVIDER" ;; esac
+  fi
   if ! is_valid_model "$PROVIDER" "$MODEL"; then
     echo "Warning: model '$MODEL' not in known list for $PROVIDER" >&2
     echo "Known $PROVIDER models:" >&2
@@ -192,6 +282,9 @@ elif [ $# -eq 1 ]; then
   case "$PROVIDER" in
     opencode|kilo|kiro|qwenmode|chatgpt) ;;
     *) echo "Unknown: $PROVIDER (use: $VALID_PROV)" >&2; usage; exit 1 ;;
+  esac
+  case "$PROVIDER" in
+    opencode|kilo) refresh_models_if_stale "$PROVIDER" ;;
   esac
   echo "--- Provider: $PROVIDER ---" >&2
   case "$PROVIDER" in
@@ -216,8 +309,8 @@ else
   fi
   choice=$(printf "%s" "$choice" | tr -d '[:space:]')
   case "$choice" in
-    1) PROVIDER="opencode"; MODEL=$(menu "Select model:" "$opencode_models") ;;
-    2) PROVIDER="kilo";     MODEL=$(menu "Select model:" "$kilo_models") ;;
+    1) PROVIDER="opencode"; refresh_models_if_stale opencode; MODEL=$(menu "Select model:" "$opencode_models") ;;
+    2) PROVIDER="kilo";     refresh_models_if_stale kilo;     MODEL=$(menu "Select model:" "$kilo_models") ;;
     3) PROVIDER="kiro";     MODEL=$(menu "Select model:" "$kiro_models") ;;
     4) PROVIDER="qwenmode"; MODEL=$(menu "Select model:" "$qwenmode_models") ;;
     5) PROVIDER="chatgpt";  MODEL=$(menu "Select model:" "$chatgpt_models") ;;
