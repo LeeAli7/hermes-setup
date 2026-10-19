@@ -1,4 +1,4 @@
-import json, os, re, sys, logging, threading, time, socket, select, binascii, uuid, secrets, string, copy
+import json, os, re, sys, logging, threading, time, socket, select, binascii, uuid, secrets, string, copy, subprocess, shlex
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import requests, urllib3
@@ -102,7 +102,7 @@ def _zen_to_inference(path, is_responses_model=False):
 CONTROL_PORT = 9051
 SOCKS_PORT = 9050
 UPSTREAM_READ_TIMEOUT = 300  # upstream response timeout (seconds)
-UPSTREAM_CONNECT_TIMEOUT = 60
+UPSTREAM_CONNECT_TIMEOUT = int(os.environ.get("FORWARDER_CONNECT_TIMEOUT", "60"))
 MAX_BODY_SIZE = int(os.environ.get("FORWARDER_MAX_BODY", str(20 * 1024 * 1024)))  # 20MB
 
 # --- 429 handling ---
@@ -137,6 +137,24 @@ TOR_REPROBE_INTERVAL = float(os.environ.get("FORWARDER_TOR_REPROBE_INTERVAL", "6
 # model after repeated 429s, set FORWARDER_FALLBACK_MODELS="model1,model2".
 FALLBACK_MODELS = [m.strip() for m in os.environ.get(
     "FORWARDER_FALLBACK_MODELS", "").split(",") if m.strip()]
+
+# --- WARP egress rotation (2026-10-19) ---
+# Direct egress is Cloudflare WARP (wg-warp0, policy-routed by the cgroup
+# mark 0x64 -> table 100; lane management in warpctl). opencode flags burn
+# per IP: on a direct-lane 403 (FreeTierError "abusive traffic" / class
+# filter / WAF) or on a 429 (per-IP rate limit) we switch to a fresh WARP
+# exit (~2-6s via `warpctl rotate`) and retry at once instead of hammering
+# the flagged IP. Storm evidence 2026-10-18: 834 403s/h — such storms add
+# nothing and likely extend the flag.
+WARP_ROTATE_ENABLED = os.environ.get("FORWARDER_WARP_ROTATE", "1") == "1"
+WARP_ROTATE_CMD = os.environ.get("FORWARDER_WARP_ROTATE_CMD", "sudo -n /usr/local/bin/warpctl rotate")
+WARP_ROTATE_TIMEOUT = float(os.environ.get("FORWARDER_WARP_ROTATE_TIMEOUT", "75"))
+WARP_ROTATE_MAX_PER_REQ = int(os.environ.get("FORWARDER_WARP_ROTATE_MAX_PER_REQ", "4"))
+# Tor exits are class-blocked by opencode since 2026-10-17 (every exit gets
+# 403 FreeTierError "can only be used from within OpenCode"). The direct
+# WARP lane replaces the ride-direct dance: FORWARDER_DISABLE_TOR=1 skips
+# Tor attempts entirely (no wasted upstream probes from this IP either).
+DISABLE_TOR = os.environ.get("FORWARDER_DISABLE_TOR", "0") == "1"
 
 # --- official-client emulation ---
 # Since ~16.09.2026 opencode.ai's free tier GATES on request shape, not just
@@ -531,6 +549,46 @@ def _arm_tor_block(seconds):
     global _tor_class_block_until
     with _tor_block_lock:
         _tor_class_block_until = time.time() + seconds
+
+
+_warp_rotate_lock = threading.Lock()
+_warp_lane_gen = 0          # incremented on every verified lane switch
+_warp_rotate_fail_ts = 0.0  # last failed warpctl run (anti-thrash)
+
+
+def _warp_rotate(reason, seen_gen=None):
+    """Switch the direct (WARP) egress to a fresh exit via warpctl.
+
+    Blocks until warpctl applied + verified a new lane (usually 2-6s).
+    Returns True when a fresh, verified lane is live. `seen_gen` is the
+    lane generation the caller's failed attempt ran against: when the lane
+    already switched since then (sibling request rotated), ride it.
+    """
+    global _warp_lane_gen, _warp_rotate_fail_ts
+    if not WARP_ROTATE_ENABLED:
+        return False
+    with _warp_rotate_lock:
+        if seen_gen is not None and _warp_lane_gen > seen_gen:
+            return True  # fresh lane already up — just retry on it
+        if time.time() - _warp_rotate_fail_ts < 10.0:
+            return False  # a rotation just failed; don't thrash warpctl
+        try:
+            cmd = shlex.split(WARP_ROTATE_CMD) + ["--reason", reason]
+            log.warning(f"warp egress rotate: {reason}")
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=WARP_ROTATE_TIMEOUT)
+            out = (p.stdout or "").strip().splitlines()
+            err = (p.stderr or "").strip().splitlines()
+            tail = (out[-1] if out else "") or (err[-1] if err else "")
+            if p.returncode == 0:
+                _warp_lane_gen += 1
+                log.warning(f"warp egress ready: {tail}")
+                return True
+            log.warning(f"warp rotate failed rc={p.returncode}: {tail}")
+        except Exception as e:
+            log.warning(f"warp rotate error: {e}")
+        _warp_rotate_fail_ts = time.time()
+        return False
 
 
 def _client_gone(conn):
@@ -2152,6 +2210,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 pass
 
         rotated = False
+        _warp_rotations = 0
         _req_t0 = time.time()
         for attempt in range(RETRY_ATTEMPTS):
             if attempt > 0 and (time.time() - _req_t0) > RETRY_WINDOW:
@@ -2165,7 +2224,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 break
             # Tor-class block (2026-10-17): while the window is hot, ride
             # direct egress; after it expires the next attempt re-probes Tor.
-            if _tor_block_active():
+            if DISABLE_TOR:
+                proxy = None
+                _attempt_exit = None
+            elif _tor_block_active():
                 proxy = None
                 _attempt_exit = None
                 log.info(f"tor-class block active — direct egress for {self.path} model={current_model}")
@@ -2184,6 +2246,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             proxy = _iso_proxy(f"m{attempt}e{_esc}")
                             continue
                         break
+            _attempt_lane_gen = _warp_lane_gen
             log.info(f"Request: {method} {url} attempt={attempt+1}/{RETRY_ATTEMPTS} proxy={proxy} exit={_attempt_exit or '?'} model={current_model}")
             try:
                 resp = self.attempt(method, url, body, headers, proxy)
@@ -2195,6 +2258,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if resp.status_code == 429:
                         wait = retry_after_seconds(resp, min(RETRY_BACKOFF * (attempt + 1), MAX_BACKOFF))
                         log.warning(f"429 for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
+                        # Per-IP rate limit on the direct lane: a fresh WARP
+                        # exit resets the quota — no waiting involved.
+                        if (proxy is None and _warp_rotations < WARP_ROTATE_MAX_PER_REQ
+                                and _warp_rotate("429", _attempt_lane_gen)):
+                            _warp_rotations += 1
+                            resp.close()
+                            _record_outcome(False)
+                            continue
                     elif resp.status_code == 400:
                         # Always log the upstream 400 body (redacted) for diagnosis
                         _psnip, _cached = _read_error_snippet(resp)
@@ -2214,6 +2285,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                 f"direct egress for {TOR_REPROBE_INTERVAL:.0f}s")
                             resp.close()
                             continue
+                        # Direct-lane 403: flagged/burned WARP exit (abuse
+                        # flag, class filter or WAF). Burn it, rotate to a
+                        # fresh exit and retry at once — never hammer a
+                        # known-flagged IP (storm evidence: 834 403s/h).
+                        if proxy is None and _warp_rotations < WARP_ROTATE_MAX_PER_REQ:
+                            _warp_rotations += 1
+                            _sn = (_psnip403 or "").strip().replace("\n", " ")[:100]
+                            if _warp_rotate(f"direct-403:{_sn or 'no-body'}", _attempt_lane_gen):
+                                resp.close()
+                                _record_outcome(False)
+                                continue
                         wait = min(RETRY_BACKOFF * (attempt + 1), MAX_BACKOFF)
                         log.warning(f"403 for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s")
                     else:
@@ -2232,10 +2314,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         else:
                             _record_failed_exit(_attempt_exit or _exit_ip_via(proxy))
 
-                    if ROTATE_ON_429:
+                    if ROTATE_ON_429 and proxy is not None:
                         # Next attempt = new isolation key = new circuit/exit.
                         # No NEWNYM here (it was the 9-14s bottleneck).
                         rotated = True
+                        continue
+
+                    if proxy is None and resp.status_code >= 500:
+                        # Direct lane + upstream 5xx: rotation won't help
+                        # (server-side hiccup) — brief pause, no hot loop.
+                        time.sleep(min(wait, 10))
                         continue
 
                     if attempt < RETRY_ATTEMPTS - 1:
@@ -2892,7 +2980,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         freetier_rotations = [0]
         FREETIER_MAX_ROTATIONS = 3
         for attempt in range(RETRY_ATTEMPTS):
-            proxy = get_proxy()
+            proxy = None if DISABLE_TOR else get_proxy()
+            _attempt_lane_gen = _warp_lane_gen
             log.info(f"anthropic: POST /v1/messages attempt={attempt+1}/{RETRY_ATTEMPTS} proxy={proxy} model={up_model}")
             try:
                 resp = self.attempt("POST", url, body, headers, proxy)
@@ -2905,7 +2994,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         log.warning(f"anthropic: {resp.status_code} model={up_model} attempt={attempt+1} retry_in={wait}s")
                     resp.close()
                     if ROTATE_ON_429:
-                        rotated = renew_tor_ip()
+                        if proxy is None:
+                            rotated = _warp_rotate("anthropic-429", _attempt_lane_gen)
+                        else:
+                            rotated = renew_tor_ip()
                         if rotated:
                             continue
                         log.warning("anthropic: IP rotation failed, waiting before retry")
@@ -2949,12 +3041,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         if resp.status_code == 403 and "freetier" in _snip.lower().replace(" ", "").replace("_", "").replace("-", "") \
                                 and freetier_rotations[0] < FREETIER_MAX_ROTATIONS:
                             freetier_rotations[0] += 1
-                            log.warning(f"anthropic: FreeTier 403 model={up_model}, rotating Tor IP ({freetier_rotations[0]}/{FREETIER_MAX_ROTATIONS}), same body retry")
+                            log.warning(f"anthropic: FreeTier 403 model={up_model}, rotating IP ({freetier_rotations[0]}/{FREETIER_MAX_ROTATIONS}), same body retry")
                             try:
                                 resp.close()
                             except Exception:
                                 pass
-                            rotated = renew_tor_ip()
+                            if proxy is None:
+                                rotated = _warp_rotate("anthropic-403", _attempt_lane_gen)
+                            else:
+                                rotated = renew_tor_ip()
                             if rotated:
                                 try:
                                     headers.update(_trace_headers())
