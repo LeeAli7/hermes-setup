@@ -3,3 +3,4 @@ __pycache__/
 logs/
 session_pins.json
 version_watch.state
+proxy_state.json
