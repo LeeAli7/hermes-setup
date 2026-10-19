@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+# warpctl — Cloudflare WARP egress controller for the hermes opencode forwarder.
+#
+# Why: opencode free-tier flags burn per egress IP (403 FreeTierError
+# "abusive traffic", 429 per-IP rate limits). Cloudflare WARP gives us
+# consumer-looking exits that PASS the free-tier class check (verified live
+# 2026-10-19: 200 + "OK" answer via WARP exits, v4 AND v6). A "lane" is a
+# (device key, listen-port, endpoint) triple; flipping it yields a fresh
+# exit IP in ~2-4s because Cloudflare's NAT maps the tunnel 5-tuple to
+# different exits. Since 2026-10-19 the verification/production transport is
+# IPv6: every wgcf registration carries its own global v6, WARP forwards v6
+# only for the address matching the active key, and the exit v6 varies per
+# (key,port) — observed 2a09:bac1:6480:18::4e7:3 / 2a09:bac5:526a:505::80:f4
+# / 2a09:bac5:526b:3137::4e7:3 — so the pool is effectively unbounded, while
+# the v4 exits sit in a tiny pool (mostly 104.28.225.x) and act as a fallback.
+# The forwarder calls `rotate` on a direct-lane 403/429 and retries on the
+# fresh exit at once — no retry storms against a flagged IP.
+#
+# Routing model (loop-safe):
+#   table 100: default dev wg-warp0 (v4 + v6) + /32 pin routes for every
+#              endpoint via the physical link (anti self-encapsulation — even
+#              a marked packet addressed to an endpoint leaves via enp0s6).
+#   rule pref 90:  fwmark 0xca6c -> main    (wg's own outer packets)
+#   rule pref 200: fwmark 0x64   -> table 100, v4 + v6 (forwarder cgroup)
+#   rule pref 300: from 172.16.0.2 / from <active v6> -> table 100 (probes)
+#
+# Commands:
+#   up                      idempotent full setup (iface, routes, rules, mark)
+#   down                    tear down marks/rules/routes + interface
+#   status                  print current lane + live wg state
+#   rotate [--reason R]     switch to a verified fresh exit; blocks until ready
+#   rotate --if-needed      rotate only if last rotation >= MIN_GAP seconds ago
+#
+# Exit codes: 0 = lane ready, 1 = no fresh lane found (last lane left applied).
+
+set -u
+
+IFACE=wg-warp0
+TABLE=100
+FW_MARK=0xca6c          # wg interface fwmark (anti self-encapsulation)
+ROUTE_MARK=0x64         # cgroup mark for the forwarder
+CGROUP_PATH="user.slice/user-1001.slice/user@1001.service/app.slice/hermes-opencode-forwarder.service"
+ANYCAST='bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo='
+# One wgcf registration per key. Cloudflare throttles/conflicts rapid
+# re-handshakes per DEVICE — a fresh key completes in ~1s while a key used
+# seconds ago flops (verified live 2026-10-19) — so every lane switch
+# advances to the next key in the pool.
+KEY_PROFILES=(
+    /etc/wireguard/wgcf-profile.conf
+    /etc/wireguard/wgcf2/wgcf-profile.conf
+    /etc/wireguard/wgcf3/wgcf-profile.conf
+    /etc/wireguard/wgcf4/wgcf-profile.conf
+    /etc/wireguard/wgcf5/wgcf-profile.conf
+    /etc/wireguard/wgcf6/wgcf-profile.conf
+)
+DPORT=4500
+ENDPOINTS=(162.159.192.1 162.159.195.1 188.114.97.1 188.114.99.1)
+LANE_SRC=172.16.0.2
+PHYS_IF=enp0s6
+PHYS_GW=10.0.0.1
+STATE_DIR=/var/lib/warpctl
+STATE_PORT=$STATE_DIR/port
+STATE_EP=$STATE_DIR/endpoint
+STATE_EXIT=$STATE_DIR/exit
+STATE_LAST=$STATE_DIR/last_rotate
+STATE_KEY=$STATE_DIR/key_idx
+BANNED=$STATE_DIR/banned        # lines: "IP EPOCH_TS"
+BAN_TTL=7200                    # re-allow an exit after 2h
+MAX_CANDIDATES=4
+MIN_GAP=4
+
+log() { echo "[warpctl] $*" >&2; }
+die() { log "$*"; exit 1; }
+
+ensure_state_dir() { mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; }
+
+key_count() {
+    local n=0 p
+    for p in "${KEY_PROFILES[@]}"; do [ -f "$p" ] && n=$((n+1)); done
+    echo "$n"
+}
+
+prune_v6_rules() { # drop from-rules for v6 addrs not equal to $1 (empty = all)
+    local keep=$1 addr
+    while read -r addr; do
+        [ -n "$addr" ] || continue
+        [ "$addr" = "$keep" ] && continue
+        ip -6 rule del from "$addr" lookup "$TABLE" pref 300 2>/dev/null || true
+    done < <(ip -6 rule show 2>/dev/null | grep -oP 'from \K[0-9a-f:]{6,}(?= lookup '"$TABLE"')')
+}
+
+apply_key_idx() { # load private key #idx from the pool + install its v6 address
+    local idx=$1 i=0 p priv v6
+    for p in "${KEY_PROFILES[@]}"; do
+        [ -f "$p" ] || continue
+        if [ "$i" -eq "$idx" ]; then
+            priv=$(grep -oP '(?<=PrivateKey = ).*' "$p")
+            printf '%s\n' "$priv" | wg set "$IFACE" private-key /dev/stdin
+            # Each registration carries its own global v6; the WARP side only
+            # forwards v6 for the address matching the active key. The exit v6
+            # NATs per (key,port) — verified live: different keys give
+            # different 2a09:bac* exits. This is the rotation breadcrumb.
+            v6=$(grep -oP '(?<=, )\K[0-9a-f:]+(?=/128)' "$p")
+            if [ -n "$v6" ]; then
+                ip -6 addr flush dev "$IFACE" scope global 2>/dev/null || true
+                ip -6 addr add "$v6/128" dev "$IFACE"
+                ip -6 rule del from "$v6" lookup "$TABLE" pref 300 2>/dev/null || true
+                ip -6 rule add from "$v6" lookup "$TABLE" pref 300
+                prune_v6_rules "$v6"
+            fi
+            return 0
+        fi
+        i=$((i+1))
+    done
+    return 1
+}
+
+apply_next_key() { # advance to the next device key (round-robin), persist
+    local n idx next
+    n=$(key_count)
+    [ "$n" -gt 0 ] || return 1
+    idx=$(cat "$STATE_KEY" 2>/dev/null || echo 0)
+    next=$(( (idx + 1) % n ))
+    if apply_key_idx "$next"; then
+        echo "$next" > "$STATE_KEY"
+        return 0
+    fi
+    return 1
+}
+
+wg_apply_lane() { # port endpoint
+    local port=$1 ep=$2
+    wg set "$IFACE" listen-port "$port"
+    wg set "$IFACE" peer "$ANYCAST" endpoint "$ep:$DPORT" persistent-keepalive 25
+}
+
+ensure_pins() { # endpoint /32 pin routes — anti self-encapsulation loop.
+    # MUST exist for every endpoint we might use BEFORE any marked packet
+    # (forwarder cgroup, fwmark 0x64) can hit table 100: without the pin the
+    # wg outer packet inherits the mark, re-enters the tunnel and the box
+    # saturates re-encrypting itself (observed twice: 33GB / 45GB cycles).
+    local ep
+    for ep in "${ENDPOINTS[@]}"; do
+        ip route replace "$ep/32" via "$PHYS_GW" dev "$PHYS_IF" table "$TABLE"
+    done
+}
+
+wait_handshake() { # 0 when a NEW handshake completes within ~12s
+    local hs0 hs i
+    hs0=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+    # SYN into the tunnel makes wg start the handshake right now
+    curl -s -o /dev/null --max-time 2 --interface "$LANE_SRC" http://10.0.0.0/ 2>/dev/null || true
+    for i in $(seq 1 24); do
+        hs=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+        if [ -n "$hs" ] && [ "$hs" != "0" ] && [ "$hs" != "$hs0" ]; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+lane_exit_ip() { # exit IP through the tunnel (handshake must already be up)
+    local i out
+    for i in 1 2; do
+        out=$(curl -s --max-time 6 --interface "$LANE_SRC" https://api.ipify.org 2>/dev/null)
+        [ -n "$out" ] && { echo "$out"; return 0; }
+    done
+    return 1
+}
+
+iface_v6() { # current global v6 address on the tunnel interface
+    ip -6 addr show dev "$IFACE" scope global 2>/dev/null | grep -oP '(?<=inet6 )\S+(?=/128)' | head -1
+}
+
+v6_exit_ip() { # $1 = tunnel v6 source; exit address opencode actually sees
+    local src=$1 i out
+    [ -n "$src" ] || return 1
+    for i in 1 2; do
+        out=$(curl -6 -s --max-time 6 --interface "$src" https://api64.ipify.org 2>/dev/null)
+        [ -n "$out" ] && { echo "$out"; return 0; }
+    done
+    return 1
+}
+
+opencode_reachable() { # $1 = optional v6 source (primary transport)
+    local code
+    if [ -n "${1:-}" ]; then
+        code=$(curl -6 -s -o /dev/null --max-time 6 --interface "$1" -w '%{http_code}' https://opencode.ai/ 2>/dev/null)
+        [ -n "$code" ] && [ "$code" != "000" ] && return 0
+    fi
+    code=$(curl -s -o /dev/null --max-time 6 --interface "$LANE_SRC" -w '%{http_code}' https://opencode.ai/ 2>/dev/null)
+    [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+is_banned() { # ip -> 0 if banned and fresh
+    local ip=$1 now ts b
+    [ -n "$ip" ] || return 1
+    [ -s "$BANNED" ] || return 1
+    now=$(date +%s)
+    while read -r b ts; do
+        if [ "$b" = "$ip" ] && [ $(( now - ts )) -lt "$BAN_TTL" ]; then
+            return 0
+        fi
+    done < "$BANNED"
+    return 1
+}
+
+ban_exit() { # ip (drop stale entries, append fresh ban)
+    local ip=$1 now
+    [ -n "$ip" ] || return 0
+    now=$(date +%s)
+    ensure_state_dir
+    if [ -s "$BANNED" ]; then
+        awk -v now="$now" -v ttl="$BAN_TTL" '{ if (now - $2 < ttl) print }' "$BANNED" > "$BANNED.tmp" || true
+        mv "$BANNED.tmp" "$BANNED"
+    fi
+    echo "$ip $now" >> "$BANNED"
+}
+
+status_line() {
+    local port ep exit_ip
+    port=$(cat "$STATE_PORT" 2>/dev/null || echo "?")
+    ep=$(cat "$STATE_EP" 2>/dev/null || echo "?")
+    exit_ip=$(cat "$STATE_EXIT" 2>/dev/null || echo "?")
+    echo "lane port=$port endpoint=$ep exit=$exit_ip"
+}
+
+cmd_up() {
+    ensure_state_dir
+    if ! ip link show "$IFACE" >/dev/null 2>&1; then
+        wg-quick up "$IFACE" >/dev/null 2>&1 || die "wg-quick up $IFACE failed"
+    fi
+    wg set "$IFACE" fwmark "$FW_MARK" 2>/dev/null || true
+    # endpoint pin routes (anti self-encapsulation) + tunnel defaults
+    ensure_pins
+    ip route replace default dev "$IFACE" table "$TABLE"
+    ip -6 route replace default dev "$IFACE" table "$TABLE"
+    # rules (idempotent delete-then-add)
+    ip rule del fwmark "$FW_MARK" lookup main pref 90 2>/dev/null || true
+    ip rule add fwmark "$FW_MARK" lookup main pref 90
+    ip rule del fwmark "$ROUTE_MARK" lookup "$TABLE" pref 200 2>/dev/null || true
+    ip rule add fwmark "$ROUTE_MARK" lookup "$TABLE" pref 200
+    ip rule del from "$LANE_SRC" lookup "$TABLE" pref 300 2>/dev/null || true
+    ip rule add from "$LANE_SRC" lookup "$TABLE" pref 300
+    ip -6 rule del fwmark "$ROUTE_MARK" lookup "$TABLE" pref 200 2>/dev/null || true
+    ip -6 rule add fwmark "$ROUTE_MARK" lookup "$TABLE" pref 200
+    # forwarder cgroup marks, both families (idempotent)
+    if ! iptables -t mangle -C OUTPUT -m cgroup --path "$CGROUP_PATH" -j MARK --set-mark "$ROUTE_MARK" 2>/dev/null; then
+        iptables -t mangle -A OUTPUT -m cgroup --path "$CGROUP_PATH" -j MARK --set-mark "$ROUTE_MARK"
+    fi
+    if ! ip6tables -t mangle -C OUTPUT -m cgroup --path "$CGROUP_PATH" -j MARK --set-mark "$ROUTE_MARK" 2>/dev/null; then
+        ip6tables -t mangle -A OUTPUT -m cgroup --path "$CGROUP_PATH" -j MARK --set-mark "$ROUTE_MARK"
+    fi
+    # active device key + its v6 address (installs the v6 source rule too)
+    apply_key_idx "$(cat "$STATE_KEY" 2>/dev/null || echo 0)" 2>/dev/null || true
+    # restore recorded lane (port/endpoint) if present
+    if [ -s "$STATE_PORT" ] && [ -s "$STATE_EP" ]; then
+        wg_apply_lane "$(cat "$STATE_PORT")" "$(cat "$STATE_EP")"
+    fi
+    log "up: ok ($(status_line))"
+}
+
+cmd_down() {
+    iptables -t mangle -D OUTPUT -m cgroup --path "$CGROUP_PATH" -j MARK --set-mark "$ROUTE_MARK" 2>/dev/null || true
+    ip6tables -t mangle -D OUTPUT -m cgroup --path "$CGROUP_PATH" -j MARK --set-mark "$ROUTE_MARK" 2>/dev/null || true
+    ip rule del fwmark "$ROUTE_MARK" lookup "$TABLE" pref 200 2>/dev/null || true
+    ip rule del from "$LANE_SRC" lookup "$TABLE" pref 300 2>/dev/null || true
+    ip rule del fwmark "$FW_MARK" lookup main pref 90 2>/dev/null || true
+    ip -6 rule del fwmark "$ROUTE_MARK" lookup "$TABLE" pref 200 2>/dev/null || true
+    prune_v6_rules "" 2>/dev/null || true
+    ip route flush table "$TABLE" 2>/dev/null || true
+    ip -6 route flush table "$TABLE" 2>/dev/null || true
+    if ip link show "$IFACE" >/dev/null 2>&1; then
+        wg-quick down "$IFACE" >/dev/null 2>&1 || true
+    fi
+    log "down: ok"
+}
+
+cmd_status() {
+    echo "$(status_line)"
+    echo "active_key_idx=$(cat "$STATE_KEY" 2>/dev/null || echo 0) of $(key_count)"
+    if ip link show "$IFACE" >/dev/null 2>&1; then
+        echo "iface_v6=$(iface_v6)"
+    fi
+    local banned_n=0 last=0
+    [ -s "$BANNED" ] && banned_n=$(wc -l < "$BANNED")
+    [ -s "$STATE_LAST" ] && last=$(cat "$STATE_LAST")
+    echo "banned=$banned_n last_rotate_epoch=$last"
+    if ip link show "$IFACE" >/dev/null 2>&1; then
+        wg show "$IFACE" | sed -n '1,6p'
+    else
+        echo "interface $IFACE: DOWN"
+    fi
+}
+
+cmd_rotate() {
+    local ifneeded=0 reason="manual"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --if-needed) ifneeded=1 ;;
+            --reason) shift; reason="${1:-manual}" ;;
+        esac
+        shift || true
+    done
+    ensure_state_dir
+    if ! ip link show "$IFACE" >/dev/null 2>&1; then
+        cmd_up
+    fi
+    ensure_pins   # never let a lane flip run without loop-breaker routes
+    local now last
+    now=$(date +%s)
+    last=$(cat "$STATE_LAST" 2>/dev/null || echo 0)
+    if [ "$ifneeded" = "1" ] && [ $(( now - last )) -lt "$MIN_GAP" ]; then
+        log "rotate: skipped (last rotation $(( now - last ))s ago)"
+        return 0
+    fi
+
+    local old_exit cur_port cur_ep cur_key
+    old_exit=$(cat "$STATE_EXIT" 2>/dev/null || true)
+    cur_port=$(cat "$STATE_PORT" 2>/dev/null || echo 0)
+    cur_ep=$(cat "$STATE_EP" 2>/dev/null || true)
+    cur_key=$(cat "$STATE_KEY" 2>/dev/null || echo 0)
+    log "rotate: reason=$reason old_exit=${old_exit:-?}"
+
+    local -a eps=("${ENDPOINTS[@]}")
+    local i j tmp n=${#eps[@]}
+    for (( i=n-1; i>0; i-- )); do
+        j=$(( RANDOM % (i+1) ))
+        tmp=${eps[i]}; eps[i]=${eps[j]}; eps[j]=$tmp
+    done
+
+    local tried=0 ep port probe_exit live_v6
+    local fb_port="" fb_ep="" fb_exit="" fb_key=""
+    while [ $tried -lt $MAX_CANDIDATES ]; do
+        ep=${eps[$(( tried % n ))]}
+        port=$(( (RANDOM % 45000) + 20000 ))
+        [ "$port" = "$cur_port" ] && port=$(( port + 1 ))
+        tried=$(( tried + 1 ))
+        if ! ip route get "$ep" mark "$ROUTE_MARK" 2>/dev/null | grep -q "dev $PHYS_IF"; then
+            log "rotate: endpoint $ep pin missing — refreshing pins"
+            ensure_pins
+            if ! ip route get "$ep" mark "$ROUTE_MARK" 2>/dev/null | grep -q "dev $PHYS_IF"; then
+                log "rotate: endpoint $ep still unpinned, skipping (loop risk)"
+                continue
+            fi
+        fi
+        log "rotate: try $tried/$MAX_CANDIDATES port=$port endpoint=$ep"
+        apply_next_key || log "rotate: key pool issue, keeping current key"
+        wg_apply_lane "$port" "$ep"
+        if ! wait_handshake; then
+            log "rotate: no handshake via lane (endpoint throttled/dead), next"
+            continue
+        fi
+        # verification uses the v6 exit: that is the address the forwarder
+        # prefers (dual-stack getaddrinfo) and therefore what opencode sees
+        live_v6=$(iface_v6)
+        probe_exit=$(v6_exit_ip "$live_v6")
+        if [ -z "$probe_exit" ]; then
+            log "rotate: handshake up but no v6 exit via lane, next"
+            continue
+        fi
+        if [ "$probe_exit" = "$old_exit" ]; then
+            log "rotate: exit unchanged ($probe_exit), next"
+            continue
+        fi
+        if is_banned "$probe_exit"; then
+            if [ -z "$fb_exit" ]; then
+                log "rotate: exit $probe_exit banned — kept as emergency fallback"
+                fb_port=$port; fb_ep=$ep; fb_exit=$probe_exit
+                fb_key=$(cat "$STATE_KEY" 2>/dev/null || echo 0)
+            else
+                log "rotate: exit $probe_exit banned, next"
+            fi
+            continue
+        fi
+        if ! opencode_reachable "$live_v6"; then
+            log "rotate: exit $probe_exit but opencode unreachable, next"
+            continue
+        fi
+        echo "$port" > "$STATE_PORT"
+        echo "$ep" > "$STATE_EP"
+        echo "$probe_exit" > "$STATE_EXIT"
+        echo "$now" > "$STATE_LAST"
+        [ -n "$old_exit" ] && ban_exit "$old_exit"   # burn the old exit only after a clean switch
+        log "rotate: READY exit=$probe_exit port=$port endpoint=$ep"
+        return 0
+    done
+    echo "$now" > "$STATE_LAST"
+    # emergency fallback: every fresh candidate was exhausted — reuse the
+    # (allegedly banned) exit whose flag has had the most time to expire
+    if [ -n "$fb_exit" ]; then
+        apply_key_idx "${fb_key:-${cur_key:-0}}" 2>/dev/null || true
+        wg_apply_lane "$fb_port" "$fb_ep"
+        if wait_handshake; then
+            echo "$fb_port" > "$STATE_PORT"
+            echo "$fb_ep" > "$STATE_EP"
+            echo "$fb_exit" > "$STATE_EXIT"
+            log "rotate: READY (fallback) exit=$fb_exit port=$fb_port endpoint=$fb_ep"
+            return 0
+        fi
+        log "rotate: fallback lane $fb_exit did not handshake"
+    fi
+    # a failed sweep must not leave the box on an unverified lane: restore
+    # the previous (working) one, key included
+    if [ -n "$cur_ep" ] && [ "$cur_port" != "0" ]; then
+        apply_key_idx "$cur_key" 2>/dev/null || true
+        wg_apply_lane "$cur_port" "$cur_ep"
+        log "rotate: FAILED after $tried candidates — restored previous lane port=$cur_port endpoint=$cur_ep"
+    else
+        log "rotate: FAILED after $tried candidates (no previous lane to restore)"
+    fi
+    return 1
+}
+
+case "${1:-}" in
+    up) cmd_up ;;
+    down) cmd_down ;;
+    status) cmd_status ;;
+    rotate) shift; cmd_rotate "$@" ;;
+    *) echo "usage: warpctl up|down|status|rotate [--if-needed] [--reason R]" >&2; exit 2 ;;
+esac
