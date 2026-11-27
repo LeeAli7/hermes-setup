@@ -17,6 +17,12 @@ hermes-agent -> kilo_forwarder.py :9001 -> Tor :9050 -> api.kilo.ai
 > [`vpn-egress/TZ.md`](vpn-egress/TZ.md).
 
 > **Changelog (read the entries, they explain WHY things look odd):**
+> - **2026-11-27 — unified egress control + 200k model pin:** new `egress.sh`
+>   switches the forwarder between Tor / WARP / VPNGate pool / direct / source
+>   address and rotates each lane (Tor `NEWNYM` + exit-country via control
+>   port, `warpctl rotate`, `hermes-egress rotate`). Default model pinned to
+>   `deepseek-v4.1-flash-free` with the real `context_length: 200000` (upstream
+>   reports context 200k / output 32k; the old 1M value over-budgeted prompts).
 > - **2026-11-27 — VPN-only external device:** new `vpn-egress/` pack for a
 >   second Linux machine. Two hot VPNGate OpenVPN tunnels in separate netns,
 >   Bun relays on 9120/9121, a VPN-only egress pool on 9200. No Oracle/static6,
@@ -59,7 +65,7 @@ sudo systemctl enable --now tor   # provides 127.0.0.1:9050 (SOCKS) + :9051 (con
 
 ```bash
 mkdir -p ~/projects/hermes/logs
-cp forwarder.py kilo_forwarder.py tls_forge.py switch.sh \
+cp forwarder.py kilo_forwarder.py tls_forge.py switch.sh egress.sh \
    oracle-guardian.sh provider-restore.sh resource-limits.sh \
    refresh-free-models.sh ~/projects/hermes/
 cp -r free-models ~/projects/hermes/
@@ -115,10 +121,11 @@ don't overwrite blindly). The load-bearing keys:
 model:
   provider: custom             # NOT opencode-zen (needs OPENCODE_ZEN_API_KEY -> AuthError);
                                # `custom` = the local keyless Zen relay (was opencode-free)
-  default: glm-5.3-flash-free
+  default: deepseek-v4.1-flash-free
   base_url: http://127.0.0.1:9000/zen/v1
   supports_vision: true        # models.dev doesn't know the local relay;
                                # without this, photos degrade to text stubs
+  context_length: 200000       # upstream limit.context=200000, limit.output=32000
 
 fallback_providers:            # 2026-10-17: when Tor exits are walled (403) the
   - provider: kilo             # agent answers via kilo (127.0.0.1:9001) instead
@@ -132,13 +139,13 @@ sessions drop until the next message — normal).
 
 ```bash
 ./switch.sh --list opencode     # live free models (auto-refreshed into free-models/)
-./switch.sh opencode mimo-v2.5-free
+./switch.sh opencode deepseek-v4.1-flash-free
 cat ~/.config/hermes-switch.state   # provider + model persist here
 
 # Text check (expect real content, not an error):
 curl -X POST http://127.0.0.1:9000/zen/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"Say OK"}],"max_tokens":20}'
+  -d '{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"Say OK"}],"max_tokens":20}'
 
 # Vision check (expect a description of the image, not a stub):
 # post chat/completions with messages[0].content = [
@@ -146,6 +153,56 @@ curl -X POST http://127.0.0.1:9000/zen/v1/chat/completions \
 #   {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}} ]
 # The forwarder maps image_url -> input_image for the Responses API.
 ```
+
+## Egress / IP rotation (Tor, WARP, VPNGate, direct)
+
+`egress.sh` is the single control point for *how* the forwarder reaches
+opencode.ai and for rotating the exit IP. It never touches Hermes itself.
+
+```bash
+./egress.sh list          # what is available on THIS host
+./egress.sh status        # mode + direct IP + Tor exit/country + WARP + VPN pool
+./egress.sh doctor        # ports, cookie auth, units, missing tools
+./egress.sh rotate tor    # SIGNAL NEWNYM, verify the exit IP actually changed
+./egress.sh country DE    # Tor ExitNodes={DE} + StrictNodes=1 (control port)
+./egress.sh country reset # back to the torrc list (no file edits)
+./egress.sh rotate warp   # warpctl rotate (needs sudo -n)
+./egress.sh rotate vpn 0  # rotate VPNGate slot 0 (needs vpn-egress installed)
+./egress.sh rotate all    # tor + warp + every vpn slot that exists
+./egress.sh test          # one chat request through :9000 (spends free quota)
+```
+
+Forwarder modes (applied via the `zz-egress-mode.conf` drop-in + restart of
+**only** `hermes-opencode-forwarder.service`; kilo keeps using Tor):
+
+| Mode | Env written into the drop-in | Exit IP |
+|------|------------------------------|---------|
+| `auto` (default) | drop-in removed | Tor, direct fallback allowed |
+| `tor` | `DISABLE_TOR=0`, `DIRECT_FALLBACK=0`, `WARP_ROTATE=0` | Tor only |
+| `direct` | `DISABLE_TOR=1`, `DIRECT_FALLBACK=1`, `WARP_ROTATE=0` | host IP |
+| `warp` | `DISABLE_TOR=1`, `WARP_ROTATE=1` | WARP lane (`warpctl`) |
+| `vpn` | `EGRESS_POOL=http://127.0.0.1:9200`, `UPSTREAM_RELAY=:9120`, Tor/direct off | VPNGate slots |
+| `source <ip>` | `DISABLE_TOR=1`, `SOURCE_ADDR=<ip>` | secondary local IP |
+
+```bash
+./egress.sh mode tor
+./egress.sh mode warp
+./egress.sh mode vpn          # after: cd vpn-egress && ./install.sh --yes
+./egress.sh mode source 10.0.0.25
+./egress.sh mode auto         # back to stock behaviour
+```
+
+Notes:
+
+- `mode vpn` only makes sense after the `vpn-egress/` pack is installed
+  (`install.sh --yes`, needs sudo for netns/OpenVPN). Without it the pool is
+  down and the forwarder returns 503 by design (no Tor/direct fallback).
+- `warpctl` also needs root (`sudo -n /usr/local/bin/warpctl rotate`); the
+  script reports it as unavailable when that is not configured.
+- Tor country switching uses the control port (`SETCONF`/`RESETCONF`), so
+  `tor/torrc` stays untouched and `country reset` is lossless.
+- Every rotation is verified by re-reading the exit IP; a 250 OK from Tor is
+  not treated as proof (NEWNYM can reuse the same exit).
 
 ## Why the forwarder looks the way it does
 
@@ -233,6 +290,7 @@ and exact counts don't survive it.
 | `tls_forge.py` | minimal TLS 1.3 client replaying the CLI ClientHello byte-exact |
 | `kilo_forwarder.py` | kilo proxy: transparent pass-through, Tor rotation |
 | `switch.sh` | provider/model switcher (sleep/wake units, persists choice) |
+| `egress.sh` | egress/IP control: Tor/WARP/VPNGate/direct/source modes, rotation, Tor exit country |
 | `refresh-free-models.sh` + `free-models/*.txt` | model-list auto-refresh (timer every 6h) + snapshots |
 | `oracle-guardian.sh` | Oracle Free Tier guards (RAM/disk/net, unit watchdog) |
 | `provider-restore.sh` / `provider-restore.service` | boot-time provider restore |
@@ -241,7 +299,7 @@ and exact counts don't survive it.
 | `hermes-kilo-forwarder.service` | user systemd unit, port 9001 (`%h`-templated) |
 | `hermes-refresh-models.service` + `.timer` | 6h model-list refresh (`%h`-templated) |
 | `hermes-gateway.service.d/watchdog.conf` | **drop-in**: disables the stream-idle killer (see Changelog 25.09) |
-| `config.yaml` | Hermes config template (opencode-free, supports_vision) |
+| `config.yaml` | Hermes config template (deepseek-v4.1-flash-free, 200k context, supports_vision) |
 | `vision-ref.png` | reference vision test image + ground truth (see Vision above) |
 
 ## Troubleshooting (symptom → cause → fix)
