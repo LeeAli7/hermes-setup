@@ -197,6 +197,9 @@ Notes:
 - `mode vpn` only makes sense after the `vpn-egress/` pack is installed
   (`install.sh --yes`, needs sudo for netns/OpenVPN). Without it the pool is
   down and the forwarder returns 503 by design (no Tor/direct fallback).
+- `mode auto` removes only `zz-egress-mode.conf`; the pack's own
+  `egress-vpn.conf` (if installed) still applies, and `status` will report
+  `mode: vpn`. Uninstall the pack to truly return to Tor/direct defaults.
 - `warpctl` also needs root (`sudo -n /usr/local/bin/warpctl rotate`); the
   script reports it as unavailable when that is not configured.
 - Tor country switching uses the control port (`SETCONF`/`RESETCONF`), so
