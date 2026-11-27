@@ -17,6 +17,13 @@ hermes-agent -> kilo_forwarder.py :9001 -> Tor :9050 -> api.kilo.ai
 > [`vpn-egress/TZ.md`](vpn-egress/TZ.md).
 
 > **Changelog (read the entries, they explain WHY things look odd):**
+> - **2026-11-27 — CLI 2.4.2 shape + quota reality:** forwarder now emulates
+>   CLI `2.4.2` (UA + 40-hex project id) and loads `cli_shape.json` (the real
+>   system prompt + 12 tool schemas captured from the CLI) so the free-Zen
+>   lane passes the gate. Tor `429` now falls back to direct egress like the
+>   `403` wall. Note: `deepseek-v4.1-flash-free` is under an upstream
+>   per-model daily limit ("Free usage limit reached", resets ~00:00 UTC) —
+>   the official CLI returns the same error; `seaglass-alpha-free` answers 200.
 > - **2026-11-27 — unified egress control + 200k model pin:** new `egress.sh`
 >   switches the forwarder between Tor / WARP / VPNGate pool / direct / source
 >   address and rotates each lane (Tor `NEWNYM` + exit-country via control
@@ -66,7 +73,7 @@ sudo systemctl enable --now tor   # provides 127.0.0.1:9050 (SOCKS) + :9051 (con
 ```bash
 mkdir -p ~/projects/hermes/logs
 cp forwarder.py kilo_forwarder.py tls_forge.py switch.sh egress.sh \
-   oracle-guardian.sh provider-restore.sh resource-limits.sh \
+   cli_shape.json oracle-guardian.sh provider-restore.sh resource-limits.sh \
    refresh-free-models.sh ~/projects/hermes/
 cp -r free-models ~/projects/hermes/
 chmod +x ~/projects/hermes/*.sh
@@ -290,6 +297,7 @@ and exact counts don't survive it.
 | File | Description |
 |------|-------------|
 | `forwarder.py` | opencode proxy: CLI headers, body padding, Responses conversion, Tor rotation |
+| `cli_shape.json` | captured CLI 2.4.2 system prompt + 12 tool schemas (free-Zen lane gate) |
 | `tls_forge.py` | minimal TLS 1.3 client replaying the CLI ClientHello byte-exact |
 | `kilo_forwarder.py` | kilo proxy: transparent pass-through, Tor rotation |
 | `switch.sh` | provider/model switcher (sleep/wake units, persists choice) |
@@ -310,6 +318,11 @@ and exact counts don't survive it.
 - **`403 FreeTierError`** → gate tightened again. Bisect in order: body
   shape → headers → TLS (re-capture CLI hello: `strace -e trace=%network`
   on `~/.opencode/bin/opencode run`, compare ClientHello bytes).
+- **`Free usage limit reached` / `429` with `retry-after` ~5–7h** → per-model
+  daily quota (resets ~00:00 UTC), not a forwarder bug. Verify with the
+  official CLI: `opencode run -m opencode/deepseek-v4.1-flash-free "OK"` —
+  the same error means wait or switch model. Tor exits can be burned
+  separately; since 2026-11-27 a Tor `429` falls back to direct egress.
 - **Agent shows photo stubs (`couldn't quite see it`)** → vision routed to
   text mode. Check `supports_vision: true` in `~/.hermes/config.yaml`, then
   gateway restart. Then run the Vision verification protocol above

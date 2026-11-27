@@ -198,10 +198,11 @@ def _verify_chain(leaf, chain, hostname):
 # ---------- forged TLS 1.3 connection ----------
 
 class ForgedTLSConnection:
-    def __init__(self, host, port=443, socks=None, timeout=60):
+    def __init__(self, host, port=443, socks=None, timeout=60, source_addr=None):
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.source_addr = source_addr
         self.sock = None
         self._rseq = 0
         self._wseq = 0
@@ -234,9 +235,11 @@ class ForgedTLSConnection:
         return out
 
     def _connect(self, socks):
+        src = (self.source_addr, 0) if self.source_addr else None
         if socks:
             sh, sp = socks
-            s = socket.create_connection((sh, sp), timeout=self.timeout)
+            s = socket.create_connection((sh, sp), timeout=self.timeout,
+                                         source_address=src)
             s.sendall(b"\x05\x01\x00")
             if self._recvn(s, 2) != b"\x05\x00":
                 raise ForgeError("SOCKS5 greeting rejected")
@@ -257,7 +260,8 @@ class ForgedTLSConnection:
             else:
                 raise ForgeError(f"SOCKS5 bad atyp {atyp}")
         else:
-            s = socket.create_connection((self.host, self.port), timeout=self.timeout)
+            s = socket.create_connection((self.host, self.port), timeout=self.timeout,
+                                         source_address=src)
         s.settimeout(self.timeout)
         self.sock = s
 
@@ -660,7 +664,7 @@ def _body_iter(conn, headers, initial, read_timeout):
 
 
 def forge_request(method, url, headers_ordered, body=b"", socks=None,
-                  connect_timeout=60, read_timeout=300):
+                  connect_timeout=60, read_timeout=300, source_addr=None):
     """Mirror of requests.request(stream=True) over forged TLS.
 
     headers_ordered: list of (name, value) in exact wire order.
@@ -676,7 +680,8 @@ def forge_request(method, url, headers_ordered, body=b"", socks=None,
         raise ForgeError("forge is purpose-built for opencode.ai")
     # NB: __init__ already ran handshake(); do NOT call it again here
     # (a second ClientHello mid-session desyncs the stream).
-    conn = ForgedTLSConnection(host, 443, socks=socks, timeout=connect_timeout)
+    conn = ForgedTLSConnection(host, 443, socks=socks, timeout=connect_timeout,
+                               source_addr=source_addr)
     body = body or b""
     raw = (f"{method} {path} HTTP/1.1\r\n").encode()
     for k, v in headers_ordered:

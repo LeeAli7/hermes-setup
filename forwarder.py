@@ -188,19 +188,19 @@ DISABLE_TOR = os.environ.get("FORWARDER_DISABLE_TOR", "0") == "1"
 # added x-session-affinity + x-session-id (same ses value) and OTel
 # b3/traceparent. Forwarder now emulates the 2.0.32 shape.
 # 2026-11-02: CLI 2.2.5 shipped; UA bumped 2.0.32 -> 2.2.5.
-# 2026-11-15: CLI 2.3.0 shipped.  The 2.2.5 shape started getting
-# FreeUsageLimitError/429 while the real 2.3.0 client still worked, so bump
-# the emulated UA.  Session-id shape stays ses_<26 alnum>; only the client
-# version token changed.
+# 2026-11-27: CLI 2.4.2 is current (captured live: UA
+# "opencode/latest/2.4.2/cli").  The 2.3.0 token now gets
+# FreeUsageLimitError/429 even with a fresh session id, while 2.4.2 passes.
 UPSTREAM_UA = os.environ.get(
     "FORWARDER_UA",
-    "opencode/latest/2.3.0/cli",
+    "opencode/latest/2.4.2/cli",
 )
-# Stable 32-hex project id (real CLI hashes its project dir; the value is
-# opaque server-side — only the shape matters). Overridable for tests.
+# Project id captured from the same 2.4.2 request (40 hex).  The real CLI
+# hashes its project dir and the server treats the value as opaque, but the
+# 2.4.x shape is 40 hex, not the old 32 hex — only the shape matters.
 UPSTREAM_PROJECT = os.environ.get(
     "FORWARDER_PROJECT",
-    "0b531ab0783dce02469f088b3043ddf2",
+    "51ec819ca2c68cf252c591585e4cdcc3a003dbf8",
 )
 def _trace_headers():
     """Fresh trace per request: a long-lived forwarder must not reuse one."""
@@ -3433,6 +3433,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                         f"attempt={attempt+1} session={_old_sid} "
                                         f"raw_ra={_ra}: rotating session")
                             _invalidate_free_zen_session(current_model, _old_sid)
+                            # 2026-11-27: Tor exits are quota-burned for the
+                            # free tier (429 until reset) while the direct IP
+                            # still answers.  Same escape as the 403 wall:
+                            # ride direct for TOR_REPROBE_INTERVAL instead of
+                            # burning 12 fresh Tor exits on the same quota.
+                            if proxy is not None and DIRECT_FALLBACK:
+                                _arm_tor_block(TOR_REPROBE_INTERVAL)
+                                log.warning("free-zen 429 on Tor — riding direct egress")
                             resp.close()
                             _record_outcome(False)
                             continue
@@ -3440,6 +3448,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         _raw_ra = (resp.headers.get("retry-after") or resp.headers.get("Retry-After") or "")
                         _egress_history(429, _raw_ra)
                         log.warning(f"429 for {self.path} model={current_model} attempt={attempt+1} retry_in={wait}s raw_ra={_raw_ra}s")
+                        # Tor exits can be quota-burned until midnight UTC
+                        # while the direct IP still answers (2026-11-27).
+                        # Ride direct instead of sampling 12 dead exits.
+                        if proxy is not None and DIRECT_FALLBACK:
+                            _arm_tor_block(TOR_REPROBE_INTERVAL)
+                            log.warning("429 on Tor — riding direct egress")
+                            resp.close()
+                            _record_outcome(False)
+                            continue
                         # Per-IP rate limit on the direct lane: a fresh WARP
                         # exit resets the quota — no waiting involved.
                         if (proxy is None and _warp_rotations < WARP_ROTATE_MAX_PER_REQ
