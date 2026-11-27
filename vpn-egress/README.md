@@ -63,7 +63,7 @@ one free-Zen request on that exit.
 | System unit | `/etc/systemd/system/hermes-vpngate-tunnel@.service` |
 | User units | `$HOME/.config/systemd/user/` |
 | CLI | `/usr/local/bin/hermes-egress` |
-| Logs | `$HOME/.hermes/ippool/*.log` |
+| Logs | `journalctl --user -u hermes-egress-pool`; `hermes-egress logs <slot>` |
 
 ## Important limits
 

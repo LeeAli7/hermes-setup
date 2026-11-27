@@ -137,15 +137,12 @@ cmd_probe() {
 
 cmd_logs() {
   local slot="${1:-}"
-  tail -n 80 "$HERMES_EGRESS_HOME/egress_pool.log" 2>/dev/null || true
+  journalctl --user -u hermes-egress-pool -n 80 --no-pager 2>/dev/null || true
   if [[ -n "$slot" ]]; then
-    if [[ "$slot" == "0" ]]; then
-      tail -n 80 "$HERMES_EGRESS_HOME/vpngate_relay.log" 2>/dev/null || true
-      tail -n 80 "$HERMES_EGRESS_HOME/vpngate_tunnel.log" 2>/dev/null || true
-    else
-      tail -n 80 "$HERMES_EGRESS_HOME/vpngate_relay_$((slot + 1)).log" 2>/dev/null || true
-      tail -n 80 "$HERMES_EGRESS_HOME/vpngate_tunnel_${slot}.log" 2>/dev/null || true
-    fi
+    journalctl --user -u "hermes-egress-vpngate-relay@${slot}" \
+      -n 80 --no-pager 2>/dev/null || true
+    sudo journalctl -u "hermes-vpngate-tunnel@${slot}" \
+      -n 80 --no-pager 2>/dev/null || true
   fi
 }
 

@@ -110,7 +110,7 @@ vpn-egress/
 | Drop-in forwarder | `$HOME/.config/systemd/user/hermes-opencode-forwarder.service.d/egress-vpn.conf` |
 | CLI | `/usr/local/bin/hermes-egress`, `/usr/local/bin/hermes-egress-run` |
 | Документация | `/usr/local/share/hermes-egress/` |
-| Логи и состояние | `$HOME/.hermes/ippool/*.log`, `*.json` |
+| Логи и состояние | journald + `vpngate_recovery*.log`, `*.json` |
 | OVPN-конфиги | `$HOME/.hermes/ippool/vpngate*/vg_*.ovpn` |
 
 Все runtime-файлы лежат вне git-репозитория и не коммитятся.
@@ -360,24 +360,26 @@ curl -sS -m 45 http://127.0.0.1:9000/zen/v1/chat/completions \
 | Симптом | Что смотреть |
 |---|---|
 | pool DOWN | `systemctl --user status hermes-egress-pool`; `journalctl --user -u hermes-egress-pool -n 100` |
-| relay 502 `VPN Down` | `sudo journalctl -u hermes-vpngate-tunnel@0 -n 100`; `tail ~/.hermes/ippool/vpngate_tunnel.log` |
+| relay 502 `VPN Down` | `sudo journalctl -u hermes-vpngate-tunnel@0 -n 100` |
 | `vpn-fail` подряд | VPNGate-серверы недоступны/блокируют UDP; попробуйте другой `VPNGATE_PHYS_IF`, проверьте firewall |
 | `/models` 429 | IP слота сожжён; `hermes-egress rotate 0`, recovery поднимет новый |
 | 429 на chat, но `/models` 200 | квота IP исчерпана; это нормально, пул переключит слот |
 | forwarder 503 | `tail ~/projects/hermes/logs/forwarder.log`; смотрите `egress lease` и `Retry-After` |
 | после reboot ничего не работает | `loginctl show-user $USER -p Linger`; `systemctl --user status ...`; `sudo systemctl status hermes-vpngate-tunnel@0` |
 
-Логи:
+Логи (journald; отдельные файлы unit-ы не пишут):
 
+```bash
+journalctl --user -u hermes-egress-pool -f
+journalctl --user -u "hermes-egress-vpngate-relay@0" -f
+journalctl --user -u "hermes-vpngate-recovery@0" -f
+sudo journalctl -u "hermes-vpngate-tunnel@0" -f
+hermes-egress logs 0
 ```
-~/.hermes/ippool/egress_pool.log
-~/.hermes/ippool/vpngate_tunnel.log
-~/.hermes/ippool/vpngate_tunnel_1.log
-~/.hermes/ippool/vpngate_relay.log
-~/.hermes/ippool/vpngate_relay_2.log
-~/.hermes/ippool/vpngate_recovery.log
-~/.hermes/ippool/vpngate_recovery1.log
-```
+
+Recovery дополнительно ведёт файл
+`$HERMES_EGRESS_HOME/vpngate_recovery<N>.log` (его удобно смотреть, когда
+systemd-юнит уже завершился).
 
 ---
 
