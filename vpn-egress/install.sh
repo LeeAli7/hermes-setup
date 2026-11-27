@@ -109,7 +109,7 @@ fi
 
 # ---------- files ----------
 mkdir -p "$INSTALL_DIR"
-sudo chown -R "$USER:$USER" "$INSTALL_DIR" 2>/dev/null || true
+sudo chown -R "$USER:$(id -gn "$USER")" "$INSTALL_DIR" 2>/dev/null || true
 # The root tunnel supervisor writes live/results here, while the user-owned
 # recovery timer must be able to drop rotate.request into the control dirs.
 for ((i = 0; i < SLOTS; i++)); do
