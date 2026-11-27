@@ -1,0 +1,8 @@
+[Unit]
+Description=Keep Hermes VPNGate recovery timers running
+After=hermes-egress-pool.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/hermes-egress/egress.env
+ExecStart=/usr/local/bin/hermes-egress-run watchdog

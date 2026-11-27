@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Internal dispatcher used by the systemd units of the VPN-only egress pack.
+# It is installed to /usr/local/bin/hermes-egress-run and must be readable by
+# both root (tunnel) and the Hermes user (relay/pool/recovery).
+set -euo pipefail
+
+ENV_FILE="${HERMES_EGRESS_ENV:-/etc/hermes-egress/egress.env}"
+if [[ ! -r "$ENV_FILE" ]]; then
+  echo "hermes-egress-run: cannot read $ENV_FILE" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+
+: "${HERMES_EGRESS_HOME:?HERMES_EGRESS_HOME is not set}"
+: "${VPNGATE_RELAY_PORT_BASE:=9120}"
+: "${VPNGATE_PROXY_PORT_BASE:=8897}"
+: "${VPNGATE_SLOTS:=2}"
+
+cmd="${1:-}"
+slot="${2:-0}"
+
+case "$cmd" in
+  tunnel)
+    [[ "$slot" =~ ^[0-9]$ ]] || { echo "bad slot: $slot" >&2; exit 2; }
+    export HERMES_EGRESS_HOME
+    export VPNGATE_SLOT="$slot"
+    export VPNGATE_OFFSET="${VPNGATE_OFFSET:-$((slot * 40))}"
+    exec /usr/bin/python3 "$HERMES_EGRESS_HOME/vpngate_tunnel.py"
+    ;;
+  relay)
+    [[ "$slot" =~ ^[0-9]$ ]] || { echo "bad slot: $slot" >&2; exit 2; }
+    : "${BUN_BIN:?BUN_BIN is not set in $ENV_FILE}"
+    relay_port=$((VPNGATE_RELAY_PORT_BASE + slot))
+    proxy_port=$((VPNGATE_PROXY_PORT_BASE + slot))
+    proxy="http://10.20${slot}.0.2:${proxy_port}"
+    export HTTPS_PROXY="$proxy"
+    export HTTP_PROXY="$proxy"
+    export NO_PROXY="127.0.0.1,localhost,::1"
+    export no_proxy="$NO_PROXY"
+    export RELAY_PORT="$relay_port"
+    export HERMES_RELAY_DEBUG="${HERMES_RELAY_DEBUG:-0}"
+    exec "$BUN_BIN" "$HERMES_EGRESS_HOME/bun_relay.ts"
+    ;;
+  recovery)
+    [[ "$slot" =~ ^[0-9]$ ]] || { echo "bad slot: $slot" >&2; exit 2; }
+    export HERMES_EGRESS_HOME
+    export VPNGATE_SLOT="$slot"
+    export VPNGATE_RELAY_PORT_BASE
+    export EGRESS_POOL_URL="${EGRESS_POOL_URL:-http://127.0.0.1:9200}"
+    exec /usr/bin/python3 "$HERMES_EGRESS_HOME/vpngate_recovery.py"
+    ;;
+  pool)
+    export HERMES_EGRESS_HOME
+    export EGRESS_POOL_PORT="${EGRESS_POOL_PORT:-9200}"
+    export EGRESS_POOL_URL="${EGRESS_POOL_URL:-http://127.0.0.1:9200}"
+    export EGRESS_POOL_SOURCES_FILE="${EGRESS_POOL_SOURCES_FILE:-/etc/hermes-egress/sources.json}"
+    export EGRESS_POOL_STATE="${EGRESS_POOL_STATE:-$HERMES_EGRESS_HOME/egress_pool_state.json}"
+    exec /usr/bin/python3 "$HERMES_EGRESS_HOME/egress_pool.py"
+    ;;
+  watchdog)
+    # Keep one recovery timer per slot alive.  These are user units, so this
+    # dispatcher is started by a user timer as well.
+    for ((i = 0; i < VPNGATE_SLOTS; i++)); do
+      systemctl --user start "hermes-vpngate-recovery@${i}.timer" || true
+    done
+    ;;
+  *)
+    echo "usage: hermes-egress-run {tunnel|relay|recovery|pool|watchdog} [slot]" >&2
+    exit 2
+    ;;
+esac

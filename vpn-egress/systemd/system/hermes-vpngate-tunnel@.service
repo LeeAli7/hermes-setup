@@ -1,0 +1,19 @@
+[Unit]
+Description=Hermes VPNGate tunnel (slot %i)
+Documentation=file:///usr/local/share/hermes-egress/TZ.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/hermes-egress/egress.env
+ExecStart=/usr/local/bin/hermes-egress-run tunnel %i
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+# The supervisor only creates/removes its own netns, veth and iptables rules.
+# It never changes the host default route.
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

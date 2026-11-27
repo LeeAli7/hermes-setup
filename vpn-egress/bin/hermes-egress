@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# Small operator CLI for the VPN-only egress pack.
+set -euo pipefail
+
+ENV_FILE="${HERMES_EGRESS_ENV:-/etc/hermes-egress/egress.env}"
+if [[ -r "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+fi
+: "${HERMES_EGRESS_HOME:=${HOME}/.hermes/ippool}"
+: "${VPNGATE_SLOTS:=2}"
+: "${VPNGATE_RELAY_PORT_BASE:=9120}"
+: "${EGRESS_POOL_URL:=http://127.0.0.1:9200}"
+
+usage() {
+  cat <<'EOF'
+usage: hermes-egress <command> [slot]
+
+  status             pool sources, relay health, live VPNGate exits
+  doctor             check dependencies, tun, ports, systemd units
+  rotate <slot>      ask the tunnel supervisor to rotate that slot now
+  probe <slot>       GET /zen/v1/models through the slot relay (no chat quota)
+  logs [slot]        tail pool / relay / tunnel logs
+  restart            restart all egress units
+EOF
+}
+
+pool_health() {
+  curl -sS -m 4 "$EGRESS_POOL_URL/health" 2>/dev/null || true
+}
+
+cmd_status() {
+  echo "== pool $EGRESS_POOL_URL =="
+  local h
+  h="$(pool_health)"
+  if [[ -z "$h" ]]; then
+    echo "POOL DOWN"
+  else
+    printf '%s' "$h" | python3 -c '
+import json, sys, time
+d = json.load(sys.stdin)
+now = time.time()
+for s in d.get("sources", []):
+    left = max(0, int(float(s.get("cooldown_until") or 0) - now))
+    print("{} {:10s} last={} cd_left={}s relay={}".format(
+        s["name"], s.get("state", "?"), s.get("last_status"),
+        left, s.get("relay")))
+'
+  fi
+  echo
+  echo "== relays =="
+  for ((i = 0; i < VPNGATE_SLOTS; i++)); do
+    local port=$((VPNGATE_RELAY_PORT_BASE + i))
+    local code
+    code="$(curl -sS -m 8 -o /dev/null -w '%{http_code}' \
+      "http://127.0.0.1:${port}/zen/v1/models" \
+      -H 'Authorization: Bearer public' 2>/dev/null || echo 000)"
+    printf 'slot %s port %s /models HTTP %s\n' "$i" "$port" "$code"
+  done
+  echo
+  echo "== live exits =="
+  for ((i = 0; i < VPNGATE_SLOTS; i++)); do
+    local f
+    if [[ "$i" == "0" ]]; then
+      f="$HERMES_EGRESS_HOME/vpngate_live.json"
+    else
+      f="$HERMES_EGRESS_HOME/vpngate_live_${i}.json"
+    fi
+    if [[ -r "$f" ]]; then
+      printf 'slot %s: %s\n' "$i" "$(cat "$f")"
+    else
+      printf 'slot %s: no live file\n' "$i"
+    fi
+  done
+}
+
+cmd_doctor() {
+  local fail=0
+  for c in openvpn iptables curl python3 ip; do
+    if command -v "$c" >/dev/null 2>&1; then
+      echo "ok: $c"
+    else
+      echo "MISSING: $c"; fail=1
+    fi
+  done
+  if [[ -x "${BUN_BIN:-}" ]]; then
+    echo "ok: bun ${BUN_BIN}"
+  elif command -v bun >/dev/null 2>&1; then
+    echo "ok: bun $(command -v bun)"
+  else
+    echo "MISSING: bun"; fail=1
+  fi
+  if [[ -c /dev/net/tun ]]; then echo "ok: /dev/net/tun"; else
+    echo "MISSING: /dev/net/tun (enable TUN/TAP in the provider panel)"; fail=1
+  fi
+  local want="${VPNGATE_PHYS_IF:-}"
+  local have
+  have="$(ip route show default 2>/dev/null | awk '/dev/ {print $5; exit}')"
+  if [[ -n "$want" && "$want" != "$have" ]]; then
+    echo "WARN: VPNGATE_PHYS_IF=$want but default route uses $have"
+  else
+    echo "ok: physical interface ${want:-$have}"
+  fi
+  for ((i = 0; i < VPNGATE_SLOTS; i++)); do
+    local port=$((VPNGATE_RELAY_PORT_BASE + i))
+    if ss -tln 2>/dev/null | grep -q ":${port} "; then
+      echo "ok: relay port $port listening"
+    else
+      echo "WARN: relay port $port is not listening"
+    fi
+  done
+  return "$fail"
+}
+
+cmd_rotate() {
+  local slot="${1:-0}"
+  local dir
+  if [[ "$slot" == "0" ]]; then
+    dir="$HERMES_EGRESS_HOME/vpngate_control"
+  else
+    dir="$HERMES_EGRESS_HOME/vpngate_control${slot}"
+  fi
+  mkdir -p "$dir"
+  printf '%s\n' "$(date +%s)" > "$dir/rotate.request"
+  echo "rotation requested for slot $slot"
+}
+
+cmd_probe() {
+  local slot="${1:-0}"
+  local port=$((VPNGATE_RELAY_PORT_BASE + slot))
+  echo "GET http://127.0.0.1:${port}/zen/v1/models"
+  curl -sS -m 15 -o /dev/null -w 'HTTP %{http_code} in %{time_total}s\n' \
+    "http://127.0.0.1:${port}/zen/v1/models" \
+    -H 'Authorization: Bearer public'
+  echo "note: /models proves the relay/VPN path; the next chat request tests quota."
+}
+
+cmd_logs() {
+  local slot="${1:-}"
+  tail -n 80 "$HERMES_EGRESS_HOME/egress_pool.log" 2>/dev/null || true
+  if [[ -n "$slot" ]]; then
+    if [[ "$slot" == "0" ]]; then
+      tail -n 80 "$HERMES_EGRESS_HOME/vpngate_relay.log" 2>/dev/null || true
+      tail -n 80 "$HERMES_EGRESS_HOME/vpngate_tunnel.log" 2>/dev/null || true
+    else
+      tail -n 80 "$HERMES_EGRESS_HOME/vpngate_relay_$((slot + 1)).log" 2>/dev/null || true
+      tail -n 80 "$HERMES_EGRESS_HOME/vpngate_tunnel_${slot}.log" 2>/dev/null || true
+    fi
+  fi
+}
+
+cmd_restart() {
+  for ((i = 0; i < VPNGATE_SLOTS; i++)); do
+    sudo systemctl restart "hermes-vpngate-tunnel@${i}.service" || true
+    systemctl --user restart "hermes-egress-vpngate-relay@${i}.service" || true
+    systemctl --user restart "hermes-vpngate-recovery@${i}.timer" || true
+  done
+  systemctl --user restart hermes-egress-pool.service || true
+  echo "restarted"
+}
+
+case "${1:-}" in
+  status) cmd_status ;;
+  doctor) cmd_doctor ;;
+  rotate) cmd_rotate "${2:-0}" ;;
+  probe) cmd_probe "${2:-0}" ;;
+  logs) cmd_logs "${2:-}" ;;
+  restart) cmd_restart ;;
+  *) usage; exit 2 ;;
+esac

@@ -1,0 +1,11 @@
+[Unit]
+Description=Rotate VPNGate slot %i to a fresh exit after a 429/timeout
+After=hermes-egress-pool.service hermes-egress-vpngate-relay@%i.service
+Wants=hermes-egress-pool.service hermes-egress-vpngate-relay@%i.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/hermes-egress/egress.env
+ExecStart=/usr/local/bin/hermes-egress-run recovery %i
+Nice=10
+IOSchedulingClass=idle

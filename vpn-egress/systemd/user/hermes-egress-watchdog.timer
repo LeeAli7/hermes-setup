@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Hermes VPNGate recovery timers every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=hermes-egress-watchdog.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Check VPNGate slot %i recovery every 20s
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=20s
+AccuracySec=5s
+RandomizedDelaySec=2s
+Unit=hermes-vpngate-recovery@%i.service
+
+[Install]
+WantedBy=timers.target

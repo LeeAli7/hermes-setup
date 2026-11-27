@@ -305,6 +305,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         url = UPSTREAM_BASE + self.path
         headers = {k: v for k, v in self.headers.items() if k.lower() not in FORBIDDEN_HEADERS}
+        # api.kilo.ai rejects the gateway's public "Bearer public" token.
+        # Use the configured Kilo token (the free lane accepts "anonymous").
+        if KILO_PUBLIC_API_KEY:
+            for _hk in [k for k in headers
+                        if k.lower() in ("authorization", "x-api-key")]:
+                headers.pop(_hk, None)
+            headers["Authorization"] = f"Bearer {KILO_PUBLIC_API_KEY}"
 
         current_model = None
         if body:

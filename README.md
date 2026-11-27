@@ -10,7 +10,19 @@ hermes-agent -> forwarder.py :9000 -> Tor :9050 -> opencode.ai
 hermes-agent -> kilo_forwarder.py :9001 -> Tor :9050 -> api.kilo.ai
 ```
 
+> **External device with VPN-only egress?** Use [`vpn-egress/`](vpn-egress/)
+> instead of the Tor steps: `cd vpn-egress && ./install.sh --yes`. It keeps two
+> hot VPNGate tunnels, adds a VPN-only pool and does not use Oracle/static6,
+> direct or Tor. The detailed Russian specification is in
+> [`vpn-egress/TZ.md`](vpn-egress/TZ.md).
+
 > **Changelog (read the entries, they explain WHY things look odd):**
+> - **2026-11-27 — VPN-only external device:** new `vpn-egress/` pack for a
+>   second Linux machine. Two hot VPNGate OpenVPN tunnels in separate netns,
+>   Bun relays on 9120/9121, a VPN-only egress pool on 9200. No Oracle/static6,
+>   no direct host IP, no Tor. Forwarder gets a pool lease per attempt (3
+>   attempts, 180s window, 60s large-body timeout). Full spec:
+>   [`vpn-egress/TZ.md`](vpn-egress/TZ.md).
 > - **2026-09-27 — vision verification:** new section “Vision” below with
 >   a reference test image (`vision-ref.png`) and a 3-question protocol
 >   that PROVES pixel vision (defeats text-summary false positives).
