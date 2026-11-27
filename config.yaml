@@ -1,16 +1,17 @@
 model:
-  default: deepseek-v4.1-flash-free
+  # 2026-11-28: opencode's `deepseek-v4.1-flash-free` is under an upstream
+  # per-model daily limit (every fresh IP/session still 429s; official CLI
+  # says "Free usage limit reached"). Fall back to `seaglass-alpha-free`.
+  default: seaglass-alpha-free
   provider: custom
   base_url: http://127.0.0.1:9000/zen/v1
-  # Upstream /zen/v1/models reports limit.context=200000, limit.output=32000.
-  context_length: 200000
+  # Upstream /zen/v1/models reports seaglass limit.context=1048576,
+  # limit.output=131072 (text-only; no image input).
+  context_length: 1048576
   # opencode-zen demands OPENCODE_ZEN_API_KEY for models outside Hermes'
   # built-in allowlist -> AuthError. `custom` (was `opencode-free`) points at
   # the same keyless local Zen relay.
-  # supports_vision: models.dev doesn't know the local relay alias and
-  # returns unknown -> gateway falls back to text-stub vision mode.
-  # Force native so photos go straight to the main model.
-  supports_vision: true
+  supports_vision: false
 # 2026-10-17: when opencode's Tor exits burn (403 wall), the agent fails over
 # to kilo (127.0.0.1:9001) instead of dying mid-turn.
 fallback_providers:

@@ -198,11 +198,13 @@ def _verify_chain(leaf, chain, hostname):
 # ---------- forged TLS 1.3 connection ----------
 
 class ForgedTLSConnection:
-    def __init__(self, host, port=443, socks=None, timeout=60, source_addr=None):
+    def __init__(self, host, port=443, socks=None, timeout=60, source_addr=None,
+                 socks_auth=None):
         self.host = host
         self.port = port
         self.timeout = timeout
         self.source_addr = source_addr
+        self.socks_auth = socks_auth
         self.sock = None
         self._rseq = 0
         self._wseq = 0
@@ -240,9 +242,25 @@ class ForgedTLSConnection:
             sh, sp = socks
             s = socket.create_connection((sh, sp), timeout=self.timeout,
                                          source_address=src)
-            s.sendall(b"\x05\x01\x00")
-            if self._recvn(s, 2) != b"\x05\x00":
-                raise ForgeError("SOCKS5 greeting rejected")
+            if self.socks_auth:
+                # Tor IsolateSOCKSAuth: a unique user/pass pair gets its own
+                # circuit, so retries can sample fresh exits without NEWNYM.
+                s.sendall(b"\x05\x02\x00\x02")
+                rep = self._recvn(s, 2)
+                if rep[1:2] == b"\x02":
+                    user, pwd = self.socks_auth
+                    ub, pb = user.encode(), pwd.encode()
+                    s.sendall(b"\x01" + bytes([len(ub)]) + ub
+                              + bytes([len(pb)]) + pb)
+                    arep = self._recvn(s, 2)
+                    if arep[1] != 0x00:
+                        raise ForgeError("SOCKS5 auth rejected")
+                elif rep[1:2] != b"\x00":
+                    raise ForgeError("SOCKS5 greeting rejected")
+            else:
+                s.sendall(b"\x05\x01\x00")
+                if self._recvn(s, 2) != b"\x05\x00":
+                    raise ForgeError("SOCKS5 greeting rejected")
             host_b = self.host.encode()
             s.sendall(b"\x05\x01\x00\x03" + bytes([len(host_b)]) + host_b
                       + struct.pack(">H", self.port))
@@ -664,7 +682,8 @@ def _body_iter(conn, headers, initial, read_timeout):
 
 
 def forge_request(method, url, headers_ordered, body=b"", socks=None,
-                  connect_timeout=60, read_timeout=300, source_addr=None):
+                  connect_timeout=60, read_timeout=300, source_addr=None,
+                  socks_auth=None):
     """Mirror of requests.request(stream=True) over forged TLS.
 
     headers_ordered: list of (name, value) in exact wire order.
@@ -681,7 +700,7 @@ def forge_request(method, url, headers_ordered, body=b"", socks=None,
     # NB: __init__ already ran handshake(); do NOT call it again here
     # (a second ClientHello mid-session desyncs the stream).
     conn = ForgedTLSConnection(host, 443, socks=socks, timeout=connect_timeout,
-                               source_addr=source_addr)
+                               source_addr=source_addr, socks_auth=socks_auth)
     body = body or b""
     raw = (f"{method} {path} HTTP/1.1\r\n").encode()
     for k, v in headers_ordered:

@@ -496,7 +496,7 @@ cmd_test() {
   local model body code out
   out="${TMPDIR:-/tmp}/hermes-egress-test.json"
   model="$(awk '{print $2}' "$HOME/.config/hermes-switch.state" 2>/dev/null)"
-  model="${model:-deepseek-v4.1-flash-free}"
+  model="${model:-seaglass-alpha-free}"
   body="$(printf '{"model":"%s","messages":[{"role":"user","content":"Reply with OK"}],"max_tokens":5,"stream":false}' "$model")"
   info "chat probe: model=$model via ${FORWARDER_URL}/zen/v1/chat/completions"
   code="$(curl -sS -m 90 --noproxy '*' -o "$out" -w '%{http_code}' \
