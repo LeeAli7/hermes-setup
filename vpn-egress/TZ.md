@@ -365,6 +365,7 @@ curl -sS -m 45 http://127.0.0.1:9000/zen/v1/chat/completions \
 | `/models` 429 | IP слота сожжён; `hermes-egress rotate 0`, recovery поднимет новый |
 | 429 на chat, но `/models` 200 | квота IP исчерпана; это нормально, пул переключит слот |
 | forwarder 503 | `tail ~/projects/hermes/logs/forwarder.log`; смотрите `egress lease` и `Retry-After` |
+| `vpngate list failed` | VPNGate API недоступен; положите `.ovpn` в `$HOME/.hermes/ippool/vpngate/vg_*.ovpn`, supervisor подхватит кэш |
 | после reboot ничего не работает | `loginctl show-user $USER -p Linger`; `systemctl --user status ...`; `sudo systemctl status hermes-vpngate-tunnel@0` |
 
 Логи (journald; отдельные файлы unit-ы не пишут):
