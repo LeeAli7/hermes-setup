@@ -2242,10 +2242,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def passthrough_free_zen(self, resp):
         """Passthrough that rewrites CLI tool names (shell -> bash) in chat."""
-        ctype = (resp.headers.get("Content-Type") or "").lower()
+        ctype = (resp.headers.get("Content-Type")
+                 or resp.headers.get("content-type") or "").lower()
         try:
             if "text/event-stream" not in ctype:
-                data = resp.content
+                # requests.Response exposes `.content`; tls_forge's
+                # ForgedResponse is a one-shot iterator with no `.content`,
+                # so read it through iter_content.
+                data = resp.content if hasattr(resp, "content") \
+                    else b"".join(resp.iter_content())
                 try:
                     ev = json.loads(data)
                     ev = _rewrite_free_zen_event(ev)
